@@ -2,7 +2,7 @@
 
 CamLabel3D is a desktop annotation and postprocessing tool for camera-only 3D bounding boxes built on top of WildDet3D.
 
-![UI](docs\images\img_outlier_detector.png)
+![UI](docs/images/img_outlier_detector.png)
 
 The current workflow is split into two stages:
 
