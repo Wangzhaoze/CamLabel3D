@@ -1,0 +1,17 @@
+{
+  "result_root": "D:/CamLabel3D/annotation_results",
+  "datasets": [
+    {
+      "id": "RAMPCNN",
+      "display_name": "RAMPCNN",
+      "root_path": "D:/Datasets/RAMPCNN",
+      "media_subdir": "images_0",
+      "default_intrinsics": {
+        "fx": 849.177455,
+        "fy": 854.207389,
+        "cx": 712.166787,
+        "cy": 543.445028
+      }
+    }
+  ]
+}

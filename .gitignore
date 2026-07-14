@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE and local settings
+.vscode/
+.idea/
+
+# Local app data
+annotation_results/
+ckpts/
+configs/dataset_sources.json
+
+# Logs and backups
+*.log
+*.bak
+
+# Build artifacts
+build/
+dist/
+workers/WildDet3D/vis4d_cuda_ops/build/
+workers/WildDet3D/vis4d_cuda_ops/*.egg-info/
+
+# Generated media / demo outputs
+workers/WildDet3D/output.png
+workers/WildDet3D/*.png
+
+# OS files
+.DS_Store
+Thumbs.db
