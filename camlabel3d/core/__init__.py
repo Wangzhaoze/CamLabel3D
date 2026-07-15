@@ -18,6 +18,7 @@ from .models import (
 )
 from .postprocess import FilterConfig, PostprocessSession, TrackSummary, WorkflowStage, clone_records
 from .processing import (
+    TRACK_BATCH_NUMERIC_FIELDS,
     BulkOperation,
     BulkOperationRegistry,
     OperationResult,
@@ -30,9 +31,13 @@ from .processing import (
     ProcessingContext,
     ProcessingEngine,
     ProcessingScope,
+    TrackBatchEditRequest,
+    TrackBatchOperationKind,
+    apply_track_batch_edit,
     build_default_bulk_operation_registry,
     build_default_outlier_registry,
     hits_to_report_json,
+    track_batch_records,
 )
 from .source_config import DatasetConfigStore, DatasetSourceConfig, DatasetSourcesConfig, IntrinsicsPreset
 from .tracking import TrackingConfig, TrackingEngine
@@ -66,14 +71,19 @@ __all__ = [
     "PromptSpec",
     "SourceContext",
     "SourceMode",
+    "TRACK_BATCH_NUMERIC_FIELDS",
     "TrackSummary",
+    "TrackBatchEditRequest",
+    "TrackBatchOperationKind",
     "TrackingConfig",
     "TrackingEngine",
     "VideoFrameProvider",
     "WorkflowStage",
+    "apply_track_batch_edit",
     "build_default_bulk_operation_registry",
     "build_default_outlier_registry",
     "clone_records",
     "hits_to_report_json",
     "open_media_source",
+    "track_batch_records",
 ]

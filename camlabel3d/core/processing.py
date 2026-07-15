@@ -27,6 +27,63 @@ OutlierScope = ProcessingScope
 OperationScope = ProcessingScope
 
 
+class TrackBatchOperationKind(str, Enum):
+    """Track-scoped spreadsheet-style numeric edit modes."""
+
+    SMOOTH = "smooth"
+    ADD = "add"
+    SUBTRACT = "subtract"
+    MULTIPLY = "multiply"
+    DIVIDE = "divide"
+
+
+TRACK_BATCH_NUMERIC_FIELDS: tuple[tuple[str, str], ...] = (
+    ("Score", "score"),
+    ("2D Score", "score_2d"),
+    ("3D Score", "score_3d"),
+    ("box2d_x1", "box2d_x1"),
+    ("box2d_y1", "box2d_y1"),
+    ("box2d_x2", "box2d_x2"),
+    ("box2d_y2", "box2d_y2"),
+    ("center_x", "center_x"),
+    ("center_y", "center_y"),
+    ("center_z", "center_z"),
+    ("yaw_deg", "yaw_deg"),
+    ("pitch_deg", "pitch_deg"),
+    ("roll_deg", "roll_deg"),
+    ("size_w", "size_w"),
+    ("size_l", "size_l"),
+    ("size_h", "size_h"),
+)
+TRACK_BATCH_NUMERIC_FIELD_SET = {field_name for _, field_name in TRACK_BATCH_NUMERIC_FIELDS}
+TRACK_BATCH_GEOMETRY_FIELDS = {
+    "center_x",
+    "center_y",
+    "center_z",
+    "yaw_deg",
+    "pitch_deg",
+    "roll_deg",
+    "size_w",
+    "size_l",
+    "size_h",
+}
+TRACK_BATCH_ANGLE_FIELDS = {"yaw_deg", "pitch_deg", "roll_deg"}
+TRACK_BATCH_POSITIVE_FIELDS = {"size_w", "size_l", "size_h"}
+
+
+@dataclass(frozen=True)
+class TrackBatchEditRequest:
+    """One batch edit request for a selected track and frame range."""
+
+    track_id: str
+    field_name: str
+    operation: TrackBatchOperationKind
+    frame_start: int
+    frame_end: int
+    operand: float = 0.0
+    smooth_window: int = 5
+
+
 @dataclass(frozen=True)
 class ParameterSpec:
     """UI-friendly numeric parameter definition."""
@@ -421,6 +478,19 @@ def _restore_record(dst: DetectionRecord, src: DetectionRecord) -> None:
         setattr(dst, field_name, getattr(src, field_name))
 
 
+def _centered_moving_average(values: Sequence[float], window_size: int) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.size <= 1:
+        return arr.copy()
+    window = max(1, int(window_size))
+    if window % 2 == 0:
+        window += 1
+    radius = window // 2
+    padded = np.pad(arr, (radius, radius), mode="edge")
+    kernel = np.ones(window, dtype=np.float64) / float(window)
+    return np.convolve(padded, kernel, mode="valid")
+
+
 def _try_update_geometry(
     record: DetectionRecord,
     context: ProcessingContext,
@@ -434,6 +504,143 @@ def _try_update_geometry(
     except Exception:
         _restore_record(record, backup)
         return False
+
+
+def _assign_batch_numeric_value(record: DetectionRecord, field_name: str, value: float) -> None:
+    numeric = float(value)
+    if not np.isfinite(numeric):
+        raise ValueError(f"{field_name} must stay finite.")
+    if field_name in TRACK_BATCH_POSITIVE_FIELDS and numeric <= 0.0:
+        raise ValueError(f"{field_name} must be greater than 0.")
+    if field_name in TRACK_BATCH_ANGLE_FIELDS:
+        numeric = _normalize_angle_deg(numeric)
+    setattr(record, field_name, numeric)
+
+
+def _try_update_numeric_field(
+    record: DetectionRecord,
+    field_name: str,
+    value: float,
+    context: ProcessingContext,
+) -> bool:
+    def mutate(item: DetectionRecord) -> None:
+        _assign_batch_numeric_value(item, field_name, value)
+
+    if field_name in TRACK_BATCH_GEOMETRY_FIELDS:
+        return _try_update_geometry(record, context, mutate)
+
+    backup = replace(record)
+    try:
+        mutate(record)
+        return True
+    except Exception:
+        _restore_record(record, backup)
+        return False
+
+
+def track_batch_records(
+    records: Sequence[DetectionRecord],
+    *,
+    track_id: str,
+    frame_start: int | None = None,
+    frame_end: int | None = None,
+    enabled_only: bool = True,
+) -> list[DetectionRecord]:
+    selected_track_id = str(track_id or "").strip()
+    if not selected_track_id:
+        return []
+    start = None if frame_start is None else int(frame_start)
+    end = None if frame_end is None else int(frame_end)
+    return sorted(
+        [
+            record
+            for record in records
+            if str(record.track_id).strip() == selected_track_id
+            and (not enabled_only or record.is_enabled)
+            and (start is None or int(record.frame_index) >= start)
+            and (end is None or int(record.frame_index) <= end)
+        ],
+        key=lambda item: (int(item.frame_index), item.det_id),
+    )
+
+
+def apply_track_batch_edit(
+    records: list[DetectionRecord],
+    request: TrackBatchEditRequest,
+    context: ProcessingContext,
+) -> OperationResult:
+    track_id = str(request.track_id or "").strip()
+    field_name = str(request.field_name or "").strip()
+    if not track_id:
+        raise ValueError("Select a track ID first.")
+    if field_name not in TRACK_BATCH_NUMERIC_FIELD_SET:
+        raise ValueError(f"Unsupported batch-edit field: {field_name}")
+    frame_start = int(request.frame_start)
+    frame_end = int(request.frame_end)
+    if frame_end < frame_start:
+        raise ValueError("End frame must be greater than or equal to start frame.")
+
+    target_records = track_batch_records(
+        records,
+        track_id=track_id,
+        frame_start=frame_start,
+        frame_end=frame_end,
+        enabled_only=False,
+    )
+    if not target_records:
+        raise ValueError("No enabled detections matched the selected track and frame range.")
+
+    operation = request.operation
+    if not isinstance(operation, TrackBatchOperationKind):
+        operation = TrackBatchOperationKind(str(operation))
+
+    values = np.asarray([float(getattr(record, field_name)) for record in target_records], dtype=np.float64)
+    if operation == TrackBatchOperationKind.SMOOTH:
+        window = max(1, int(request.smooth_window))
+        if field_name in TRACK_BATCH_ANGLE_FIELDS:
+            working = _unwrap_angles_deg(values)
+            updated_values = _centered_moving_average(working, window)
+        else:
+            updated_values = _centered_moving_average(values, window)
+    else:
+        operand = float(request.operand)
+        if not np.isfinite(operand):
+            raise ValueError("Operand must be finite.")
+        if operation == TrackBatchOperationKind.ADD:
+            updated_values = values + operand
+        elif operation == TrackBatchOperationKind.SUBTRACT:
+            updated_values = values - operand
+        elif operation == TrackBatchOperationKind.MULTIPLY:
+            updated_values = values * operand
+        elif operation == TrackBatchOperationKind.DIVIDE:
+            if abs(operand) <= EPS:
+                raise ValueError("Division by zero is not allowed.")
+            updated_values = values / operand
+        else:
+            raise ValueError(f"Unsupported batch operation: {operation}")
+
+    updated = 0
+    affected: list[str] = []
+    for record, value in zip(target_records, updated_values, strict=False):
+        if _try_update_numeric_field(record, field_name, float(value), context):
+            updated += 1
+            affected.append(record.det_id)
+
+    label_by_operation = {
+        TrackBatchOperationKind.SMOOTH: "Smoothed",
+        TrackBatchOperationKind.ADD: "Added",
+        TrackBatchOperationKind.SUBTRACT: "Subtracted",
+        TrackBatchOperationKind.MULTIPLY: "Multiplied",
+        TrackBatchOperationKind.DIVIDE: "Divided",
+    }
+    return OperationResult(
+        updated_count=updated,
+        message=(
+            f"{label_by_operation[operation]} {field_name} for {updated} detections "
+            f"in track {track_id} across frames {frame_start}-{frame_end}."
+        ),
+        affected_det_ids=tuple(sorted(set(affected))),
+    )
 
 
 class EulerAngleSpikeRule(OutlierRule):

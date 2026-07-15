@@ -8,6 +8,9 @@ from camlabel3d.core.processing import (
     OutlierScope,
     ProcessingContext,
     ProcessingEngine,
+    TrackBatchEditRequest,
+    TrackBatchOperationKind,
+    apply_track_batch_edit,
     build_default_bulk_operation_registry,
     build_default_outlier_registry,
 )
@@ -196,6 +199,76 @@ class ProcessingEngineTests(unittest.TestCase):
 
         self.assertNotAlmostEqual(records[1].center_x, 10.0, places=4)
         self.assertEqual(original_sizes, [(record.size_w, record.size_l, record.size_h) for record in records])
+
+    def test_track_batch_add_updates_only_selected_track_range(self) -> None:
+        records = [
+            make_record(0, center_x=1.0, track_id="1"),
+            make_record(1, center_x=2.0, track_id="1"),
+            make_record(2, center_x=3.0, track_id="1"),
+            make_record(1, center_x=9.0, track_id="2"),
+        ]
+        context = ProcessingContext(records=records)
+
+        result = apply_track_batch_edit(
+            records,
+            TrackBatchEditRequest(
+                track_id="1",
+                field_name="center_x",
+                operation=TrackBatchOperationKind.ADD,
+                frame_start=1,
+                frame_end=2,
+                operand=5.0,
+            ),
+            context,
+        )
+
+        self.assertEqual(result.updated_count, 2)
+        self.assertAlmostEqual(records[0].center_x, 1.0, places=6)
+        self.assertAlmostEqual(records[1].center_x, 7.0, places=6)
+        self.assertAlmostEqual(records[2].center_x, 8.0, places=6)
+        self.assertAlmostEqual(records[3].center_x, 9.0, places=6)
+
+    def test_track_batch_smooth_yaw_uses_angle_unwrap(self) -> None:
+        records = [
+            make_record(0, yaw_deg=170.0, track_id="1"),
+            make_record(1, yaw_deg=-170.0, track_id="1"),
+            make_record(2, yaw_deg=170.0, track_id="1"),
+        ]
+        context = ProcessingContext(records=records)
+
+        result = apply_track_batch_edit(
+            records,
+            TrackBatchEditRequest(
+                track_id="1",
+                field_name="yaw_deg",
+                operation=TrackBatchOperationKind.SMOOTH,
+                frame_start=0,
+                frame_end=2,
+                smooth_window=3,
+            ),
+            context,
+        )
+
+        self.assertEqual(result.updated_count, 3)
+        self.assertLess(abs(abs(records[1].yaw_deg) - 180.0), 15.0)
+
+    def test_track_batch_divide_by_zero_is_rejected(self) -> None:
+        records = [make_record(0, center_z=10.0, track_id="1")]
+        context = ProcessingContext(records=records)
+
+        with self.assertRaisesRegex(ValueError, "Division by zero"):
+            apply_track_batch_edit(
+                records,
+                TrackBatchEditRequest(
+                    track_id="1",
+                    field_name="center_z",
+                    operation=TrackBatchOperationKind.DIVIDE,
+                    frame_start=0,
+                    frame_end=0,
+                    operand=0.0,
+                ),
+                context,
+            )
 
 
 if __name__ == "__main__":

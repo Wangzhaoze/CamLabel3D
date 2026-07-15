@@ -61,9 +61,11 @@ from camlabel3d.core import (
     SourceContext,
     SourceMode,
     TrackSummary,
+    TrackBatchEditRequest,
     TrackingConfig,
     VideoFrameProvider,
     WorkflowStage,
+    apply_track_batch_edit,
     build_default_bulk_operation_registry,
     build_default_outlier_registry,
     clone_records,
@@ -72,6 +74,7 @@ from camlabel3d.core import (
 from .bookmark_slider import BookmarkSlider
 from .canvas import FrameCanvas
 from .input_widgets import MenuWheelComboBox, NoWheelDoubleSpinBox, NoWheelSpinBox
+from .track_batch_dialog import TrackBatchEditorDialog
 from .worker import DetectionWorker, TrackingWorker
 
 RESULTS_TABLE_COLUMNS: list[tuple[str, str, str, bool]] = [
@@ -116,6 +119,7 @@ OUTLIER_RULE_COLORS: dict[str, QColor] = {
     "size_spike": QColor(64, 156, 255),
     "center_spike": QColor(74, 201, 126),
 }
+AUTO_OUTLIER_REFRESH_RECORD_LIMIT = 12000
 
 
 class ActivitySection(str, Enum):
@@ -152,6 +156,8 @@ class MainWindow(QMainWindow):
         self.current_result_dir: Path | None = None
         self.current_active_source_path: Path | None = None
         self.current_annotation_csv_override_path: Path | None = None
+        self.track_batch_dialog: TrackBatchEditorDialog | None = None
+        self._suspend_track_batch_dialog_sync = False
         self.manual_source_path: Path | None = None
         self.selected_dataset_id = ""
         self.selected_recording_id = ""
@@ -177,6 +183,7 @@ class MainWindow(QMainWindow):
         self.outlier_hits_by_track_id: dict[str, list[OutlierHit]] = {}
         self.outlier_hits_by_rule_id: dict[str, list[OutlierHit]] = {}
         self.outlier_frames: set[int] = set()
+        self.outlier_refresh_deferred = False
         self.outlier_rule_enabled: dict[str, bool] = {
             rule.rule_id: bool(rule.default_enabled)
             for rule in self.outlier_registry.all()
@@ -761,6 +768,9 @@ class MainWindow(QMainWindow):
         self.merge_track_btn = QPushButton("Merge Selected -> Target", merge_row)
         merge_layout.addWidget(self.merge_track_btn)
         layout.addWidget(merge_row)
+
+        self.open_track_batch_btn = QPushButton("Open Track Batch Editor", group)
+        layout.addWidget(self.open_track_batch_btn)
         return group
 
     def _build_results_group(self, parent: QWidget) -> QGroupBox:
@@ -866,6 +876,7 @@ class MainWindow(QMainWindow):
         self.lock_track_btn.clicked.connect(self._lock_selected_track)
         self.unlock_track_btn.clicked.connect(self._unlock_selected_track)
         self.merge_track_btn.clicked.connect(self._merge_selected_track)
+        self.open_track_batch_btn.clicked.connect(self._open_track_batch_editor)
 
         self.results_table.currentCellChanged.connect(self._on_results_selection_changed)
         self.results_table.itemChanged.connect(self._on_results_table_item_changed)
@@ -1142,6 +1153,20 @@ class MainWindow(QMainWindow):
     def _refresh_outlier_analysis_requested(self) -> None:
         self._refresh_outlier_analysis(show_status=True)
 
+    def _refresh_outlier_analysis_after_heavy_update(self) -> str | None:
+        if len(self.records) <= AUTO_OUTLIER_REFRESH_RECORD_LIMIT:
+            self.outlier_refresh_deferred = False
+            self._refresh_outlier_analysis()
+            return None
+        self.outlier_refresh_deferred = True
+        self._clear_outlier_state()
+        message = (
+            f"Outlier refresh deferred for {len(self.records)} rows. "
+            "Use Refresh Outliers when needed."
+        )
+        self.statusBar().showMessage(message, 7000)
+        return message
+
     def _refresh_outlier_analysis(self, show_status: bool = False) -> None:
         if show_status:
             self.statusBar().showMessage("Refreshing outliers...")
@@ -1153,6 +1178,7 @@ class MainWindow(QMainWindow):
             if show_status:
                 self.statusBar().showMessage("Outlier refresh skipped: postprocessing is not active.", 5000)
             return
+        self.outlier_refresh_deferred = False
         enabled_rules = self._enabled_outlier_rule_ids()
         if not enabled_rules:
             self._clear_outlier_state()
@@ -1751,6 +1777,8 @@ class MainWindow(QMainWindow):
         self.active_source_path_edit.clear()
         self.annotation_csv_path_edit.clear()
         self.output_csv_edit.clear()
+        if self.track_batch_dialog is not None:
+            self.track_batch_dialog.hide()
         if clear_manual_path:
             self.manual_source_path = None
             self.manual_path_edit.clear()
@@ -1866,6 +1894,8 @@ class MainWindow(QMainWindow):
                     break
             if target_index >= 0:
                 self.merge_target_combo.setCurrentIndex(target_index)
+        if not self._suspend_track_batch_dialog_sync:
+            self._refresh_track_batch_editor(selected_track_id=selected_track_id or None)
         self._update_action_states()
 
     def _selected_track_id(self) -> str | None:
@@ -1903,7 +1933,157 @@ class MainWindow(QMainWindow):
                 if candidate and candidate != selected_track_id:
                     self.merge_target_combo.setCurrentIndex(index)
                     break
+        self._refresh_track_batch_editor(selected_track_id=selected_track_id or None)
         self._update_action_states()
+
+    def _refresh_track_batch_editor(
+        self,
+        selected_track_id: str | None = None,
+        *,
+        changed_fields: Sequence[str] | None = None,
+    ) -> None:
+        if self.track_batch_dialog is None:
+            return
+        if self.current_provider is None:
+            self.track_batch_dialog.hide()
+            return
+        self.track_batch_dialog.sync_from_records(
+            records=self.records,
+            track_summaries=self.postprocess_session.build_track_summaries(self.records),
+            selected_track_id=selected_track_id,
+            changed_fields=changed_fields,
+        )
+
+    def _open_track_batch_editor(self) -> None:
+        if not self._is_postprocessing_stage():
+            self._show_warning(
+                "Postprocessing Required",
+                "Track batch editing is only available after postprocessing starts.",
+            )
+            return
+        track_id = self._selected_track_id()
+        if not track_id:
+            self._show_warning("No Track Selected", "Select one track first.")
+            return
+        if self.track_batch_dialog is None:
+            self.track_batch_dialog = TrackBatchEditorDialog(
+                parent=self,
+                on_apply=self._apply_track_batch_request,
+                on_undo=self._undo_from_track_batch_dialog,
+                on_commit_edits=self._commit_track_batch_table_edits,
+                on_jump_frame=self._set_current_frame,
+            )
+        self._refresh_track_batch_editor(selected_track_id=track_id)
+        self.track_batch_dialog.show()
+        self.track_batch_dialog.raise_()
+        self.track_batch_dialog.activateWindow()
+
+    def _undo_from_track_batch_dialog(self, selected_track_id: str | None) -> str | None:
+        if not self._is_postprocessing_stage():
+            self._show_warning("Postprocessing Required", "Undo is only available in postprocessing.")
+            return None
+        if not self.postprocess_session.has_undo():
+            self.statusBar().showMessage("Nothing to undo.", 3000)
+            return "Nothing to undo."
+        self._undo_last_change()
+        self._refresh_track_batch_editor(selected_track_id=selected_track_id)
+        return "Reverted the last change."
+
+    def _apply_track_batch_request(self, request: TrackBatchEditRequest) -> str | None:
+        if not self._is_postprocessing_stage():
+            self._show_warning(
+                "Postprocessing Required",
+                "Track batch editing is only available after postprocessing starts.",
+            )
+            return None
+        if self._is_background_task_running():
+            self._show_warning("Run in Progress", "Cancel the active run before applying a batch edit.")
+            return None
+        before = clone_records(self.records)
+        context = self._build_processing_context(require_reprojection=True)
+        if context is None:
+            return None
+        try:
+            result = apply_track_batch_edit(self.records, request, context)
+        except Exception as exc:
+            self._show_warning("Batch Edit Failed", str(exc))
+            return None
+        if result.updated_count <= 0:
+            self.statusBar().showMessage("The requested batch edit made no changes.", 5000)
+            return result.message
+
+        self.postprocess_session.push_undo_snapshot(before)
+        self._persist_active_records()
+        deferred_message = self._refresh_outlier_analysis_after_heavy_update()
+        self._refresh_current_frame_view()
+        self._refresh_track_table(preserve_track_id=request.track_id)
+        self._refresh_track_batch_editor(selected_track_id=request.track_id, changed_fields=[request.field_name])
+        status_message = result.message if not deferred_message else f"{result.message} {deferred_message}"
+        self.statusBar().showMessage(status_message, 5000)
+        return status_message
+
+    def _commit_track_batch_table_edits(
+        self,
+        edits: list[tuple[str, str, str, object]],
+        selected_track_id: str | None,
+    ) -> str | None:
+        if not self._is_postprocessing_stage():
+            self._show_warning(
+                "Postprocessing Required",
+                "Track batch editing is only available after postprocessing starts.",
+            )
+            return None
+        if self._is_background_task_running():
+            self._show_warning("Run in Progress", "Cancel the active run before applying table edits.")
+            return None
+        if not edits:
+            self._refresh_track_batch_editor(selected_track_id=selected_track_id)
+            return "No local table edits to apply."
+        before = clone_records(self.records)
+        changed_any = False
+        last_record: DetectionRecord | None = None
+        for det_id, field_name, value_kind, new_value in edits:
+            record = self._record_by_det_id(det_id)
+            if record is None:
+                self.records = clone_records(before)
+                message = "One of the edited detections no longer exists."
+                self.statusBar().showMessage(message, 6000)
+                self._refresh_track_batch_editor(selected_track_id=selected_track_id)
+                return message
+            changed, error_message = self._apply_record_field_edit(record, field_name, value_kind, new_value)
+            if error_message:
+                self.records = clone_records(before)
+                self.statusBar().showMessage(error_message, 6000)
+                self._refresh_track_batch_editor(selected_track_id=selected_track_id)
+                return error_message
+            changed_any = changed_any or changed
+            last_record = record
+        if not changed_any:
+            self._refresh_track_batch_editor(selected_track_id=selected_track_id)
+            return "No local table edits to apply."
+
+        self.postprocess_session.push_undo_snapshot(before)
+        self._autosave()
+        deferred_message = self._refresh_outlier_analysis_after_heavy_update()
+        self._suspend_track_batch_dialog_sync = True
+        try:
+            self._refresh_current_frame_view()
+            preserve_track_id = (
+                (last_record.track_id if last_record is not None else "") or selected_track_id or self._selected_track_id()
+            )
+            self._refresh_track_table(preserve_track_id=preserve_track_id)
+        finally:
+            self._suspend_track_batch_dialog_sync = False
+        self._refresh_info_panel()
+        self._refresh_track_batch_editor(
+            selected_track_id=selected_track_id,
+            changed_fields=sorted({field_name for _, field_name, _, _ in edits}),
+        )
+        message = f"Applied {len(edits)} table edit(s)."
+        if deferred_message:
+            message = f"{message} {deferred_message}"
+        self.statusBar().showMessage(message, 5000)
+        return message
 
     def _start_postprocessing_stage(self) -> None:
         if not self.current_provider:
@@ -2569,24 +2749,44 @@ class MainWindow(QMainWindow):
         value_kind: str,
     ) -> None:
         before = clone_records(self.records)
-        if value_kind == "bool":
-            old_value = bool(record.is_enabled)
-            record.is_enabled = item.checkState() == Qt.CheckState.Checked
-            if record.is_enabled == old_value:
-                return
-            self.postprocess_session.push_undo_snapshot(before)
-            self._autosave()
-            self._refresh_outlier_analysis()
-            self._refresh_preview()
-            self._refresh_track_table()
-            self._refresh_info_panel()
+        proposed_value: object = (
+            item.checkState() == Qt.CheckState.Checked if value_kind == "bool" else item.text().strip()
+        )
+        changed, error_message = self._apply_record_field_edit(record, field_name, value_kind, proposed_value)
+        self._results_table_internal_change = True
+        with QSignalBlocker(self.results_table):
+            if value_kind == "bool":
+                item.setCheckState(Qt.CheckState.Checked if bool(getattr(record, field_name)) else Qt.CheckState.Unchecked)
+            else:
+                item.setText(self._format_result_field(record, field_name, value_kind))
+        self._results_table_internal_change = False
+        if error_message:
+            self.statusBar().showMessage(error_message, 6000)
             return
-        new_text = item.text().strip()
+        if not changed:
+            return
+
+        self.postprocess_session.push_undo_snapshot(before)
+        self._autosave()
+        self._refresh_outlier_analysis()
+        self._refresh_preview()
+        self._refresh_track_table()
+        self._refresh_info_panel()
+
+    def _apply_record_field_edit(
+        self,
+        record: DetectionRecord,
+        field_name: str,
+        value_kind: str,
+        proposed_value: object,
+    ) -> tuple[bool, str | None]:
         old_value = getattr(record, field_name)
         old_track_status = record.track_status
         try:
-            if value_kind == "float":
-                parsed_value = float(new_text)
+            if value_kind == "bool":
+                setattr(record, field_name, bool(proposed_value))
+            elif value_kind == "float":
+                parsed_value = float(str(proposed_value).strip())
                 if not np.isfinite(parsed_value):
                     raise ValueError("Value must be finite.")
                 if field_name in {"size_w", "size_l", "size_h"} and parsed_value <= 0:
@@ -2607,6 +2807,7 @@ class MainWindow(QMainWindow):
                         image_shape=self.current_provider.frame_shape(record.frame_index),
                     )
             else:
+                new_text = str(proposed_value).strip()
                 if field_name == "category" and not new_text:
                     raise ValueError("Category cannot be empty.")
                 if field_name == "track_id" and record.track_status == "locked":
@@ -2617,33 +2818,10 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             setattr(record, field_name, old_value)
             record.track_status = old_track_status
-            self._results_table_internal_change = True
-            with QSignalBlocker(self.results_table):
-                if value_kind == "bool":
-                    item.setCheckState(Qt.CheckState.Checked if bool(old_value) else Qt.CheckState.Unchecked)
-                else:
-                    item.setText(self._format_result_field(record, field_name, value_kind))
-            self._results_table_internal_change = False
-            self.statusBar().showMessage(f"Edit rejected: {exc}", 6000)
-            return
+            return False, f"Edit rejected: {exc}"
 
-        if getattr(record, field_name) == old_value and record.track_status == old_track_status:
-            self._results_table_internal_change = True
-            with QSignalBlocker(self.results_table):
-                item.setText(self._format_result_field(record, field_name, value_kind))
-            self._results_table_internal_change = False
-            return
-
-        self._results_table_internal_change = True
-        with QSignalBlocker(self.results_table):
-            item.setText(self._format_result_field(record, field_name, value_kind))
-        self._results_table_internal_change = False
-        self.postprocess_session.push_undo_snapshot(before)
-        self._autosave()
-        self._refresh_outlier_analysis()
-        self._refresh_preview()
-        self._refresh_track_table()
-        self._refresh_info_panel()
+        changed = getattr(record, field_name) != old_value or record.track_status != old_track_status
+        return changed, None
 
     def _format_result_field(self, record: DetectionRecord, field_name: str, value_kind: str) -> str:
         if value_kind == "computed" and field_name == "_outlier_flags":
@@ -2784,6 +2962,8 @@ class MainWindow(QMainWindow):
         lines.append(f"Enabled Detections: {sum(1 for record in self.records if record.is_enabled)}")
         lines.append(f"Outlier Hits: {len(self.outlier_hits_global)}")
         lines.append(f"Outlier Frames: {len(self.outlier_frames)}")
+        if self.outlier_refresh_deferred:
+            lines.append("Outlier Status: deferred")
         lines.append(
             f"Intrinsics Mode: {'actual' if self.use_actual_k_checkbox.isChecked() else 'predicted'}"
         )
@@ -2866,6 +3046,7 @@ class MainWindow(QMainWindow):
         self.delete_track_btn.setEnabled(has_track_selection and postprocessing and not running)
         self.lock_track_btn.setEnabled(has_track_selection and postprocessing and not running)
         self.unlock_track_btn.setEnabled(has_track_selection and postprocessing and not running)
+        self.open_track_batch_btn.setEnabled(has_track_selection and postprocessing and not running)
         selected_track_id = self._selected_track_id() or ""
         merge_target = str(self.merge_target_combo.currentData() or "").strip()
         self.merge_track_btn.setEnabled(
