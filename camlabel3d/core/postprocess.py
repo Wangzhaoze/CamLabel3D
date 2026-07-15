@@ -91,6 +91,20 @@ class PostprocessSession:
             return raw.with_name(f"{stem}.latest{suffix}")
         return raw.with_name(f"{raw.stem}.latest{raw.suffix}")
 
+    @staticmethod
+    def derive_raw_path(csv_path: str | Path) -> Path:
+        csv = Path(csv_path).resolve()
+        latest_suffix = ".latest.camlabel3d.csv"
+        if csv.name.endswith(latest_suffix):
+            stem = csv.name[: -len(latest_suffix)]
+            return csv.with_name(f"{stem}.camlabel3d.csv")
+        return csv
+
+    @classmethod
+    def is_latest_csv_path(cls, csv_path: str | Path) -> bool:
+        csv = Path(csv_path).resolve()
+        return csv == cls.derive_latest_path(cls.derive_raw_path(csv))
+
     def clear(self) -> None:
         self.raw_path = None
         self.latest_path = None
@@ -98,11 +112,32 @@ class PostprocessSession:
         self.stage = WorkflowStage.DETECTION
         self.clear_undo()
 
-    def activate(self, raw_path: str | Path) -> tuple[WorkflowStage, Path, list[DetectionRecord]]:
-        self.raw_path = Path(raw_path).resolve()
-        self.latest_path = self.derive_latest_path(self.raw_path)
+    def activate(
+        self,
+        raw_path: str | Path,
+        selected_csv_path: str | Path | None = None,
+    ) -> tuple[WorkflowStage, Path, list[DetectionRecord]]:
+        base_raw_path = Path(raw_path).resolve()
         self.clear_undo()
 
+        if selected_csv_path is not None:
+            selected_path = Path(selected_csv_path).resolve()
+            if not selected_path.exists():
+                raise FileNotFoundError(f"Annotation CSV not found: {selected_path}")
+            if self.is_latest_csv_path(selected_path):
+                self.raw_path = self.derive_raw_path(selected_path)
+                self.latest_path = selected_path
+                self.stage = WorkflowStage.POSTPROCESSING
+            else:
+                self.raw_path = selected_path
+                self.latest_path = self.derive_latest_path(selected_path)
+                self.stage = WorkflowStage.DETECTION
+            self.active_path = selected_path
+            records = self._load_from(selected_path)
+            return self.stage, self.active_path, records
+
+        self.raw_path = base_raw_path
+        self.latest_path = self.derive_latest_path(self.raw_path)
         if self.latest_path.exists():
             self.stage = WorkflowStage.POSTPROCESSING
             self.active_path = self.latest_path
@@ -121,7 +156,7 @@ class PostprocessSession:
             return False
         if self.raw_path is None:
             return False
-        return self.raw_path.exists() or bool(records)
+        return bool(records)
 
     def start_postprocessing(self, records: list[DetectionRecord]) -> tuple[Path, list[DetectionRecord]]:
         if self.raw_path is None or self.latest_path is None:

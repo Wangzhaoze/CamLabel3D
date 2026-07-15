@@ -148,7 +148,10 @@ class MainWindow(QMainWindow):
         self.current_raw_csv_path: Path | None = None
         self.current_latest_csv_path: Path | None = None
         self.current_output_csv_path: Path | None = None
+        self.current_source_output_csv_path: Path | None = None
         self.current_result_dir: Path | None = None
+        self.current_active_source_path: Path | None = None
+        self.current_annotation_csv_override_path: Path | None = None
         self.manual_source_path: Path | None = None
         self.selected_dataset_id = ""
         self.selected_recording_id = ""
@@ -439,19 +442,24 @@ class MainWindow(QMainWindow):
             self.main_view_splitter.setSizes([max(total_height - desired_bottom, 140), desired_bottom])
 
     def _build_source_group(self, parent: QWidget) -> QGroupBox:
-        group = QGroupBox("Source", parent)
+        group = QGroupBox("File", parent)
         layout = QVBoxLayout(group)
         layout.setContentsMargins(8, 10, 8, 8)
         layout.setSpacing(8)
+
+        data_group = QGroupBox("Data Source", group)
+        data_layout = QVBoxLayout(data_group)
+        data_layout.setContentsMargins(8, 10, 8, 8)
+        data_layout.setSpacing(8)
 
         mode_layout = QFormLayout()
         self.source_mode_combo = MenuWheelComboBox(group)
         for mode in SourceMode:
             self.source_mode_combo.addItem(mode.value, mode.value)
         mode_layout.addRow("Mode", self.source_mode_combo)
-        layout.addLayout(mode_layout)
+        data_layout.addLayout(mode_layout)
 
-        self.dataset_section = QWidget(group)
+        self.dataset_section = QWidget(data_group)
         dataset_layout = QFormLayout(self.dataset_section)
         dataset_layout.setContentsMargins(0, 0, 0, 0)
         dataset_layout.setSpacing(6)
@@ -468,9 +476,9 @@ class MainWindow(QMainWindow):
         self.recording_combo = MenuWheelComboBox(self.dataset_section)
         dataset_layout.addRow("Dataset", self.dataset_combo)
         dataset_layout.addRow("Recording", self.recording_combo)
-        layout.addWidget(self.dataset_section)
+        data_layout.addWidget(self.dataset_section)
 
-        self.manual_section = QWidget(group)
+        self.manual_section = QWidget(data_group)
         manual_layout = QFormLayout(self.manual_section)
         manual_layout.setContentsMargins(0, 0, 0, 0)
         manual_layout.setSpacing(6)
@@ -481,23 +489,51 @@ class MainWindow(QMainWindow):
         self.open_video_btn = QPushButton("Open Video", self.manual_section)
         self.open_folder_btn = QPushButton("Open Image Folder", self.manual_section)
         manual_layout.addRow("", self._row_widget(self.open_video_btn, self.open_folder_btn))
-        layout.addWidget(self.manual_section)
+        data_layout.addWidget(self.manual_section)
 
         source_path_form = QFormLayout()
-        self.active_source_path_edit = QLineEdit(group)
+        self.active_source_path_edit = QLineEdit(data_group)
         self.active_source_path_edit.setReadOnly(True)
         source_path_form.addRow("Active Path", self.active_source_path_edit)
-        layout.addLayout(source_path_form)
+        data_layout.addLayout(source_path_form)
 
-        output_form = QFormLayout()
-        self.output_csv_edit = QLineEdit(group)
+        layout.addWidget(data_group)
+
+        annotation_group = QGroupBox("Annotation CSV", group)
+        annotation_layout = QVBoxLayout(annotation_group)
+        annotation_layout.setContentsMargins(8, 10, 8, 8)
+        annotation_layout.setSpacing(8)
+
+        self.annotation_csv_hint_label = QLabel(
+            "Load an existing annotation CSV for the current media source, or leave it empty to use the source-derived CSV. "
+            "If the source has not been annotated yet, a blank CSV will be created automatically.",
+            annotation_group,
+        )
+        self.annotation_csv_hint_label.setWordWrap(True)
+        annotation_layout.addWidget(self.annotation_csv_hint_label)
+
+        annotation_form = QFormLayout()
+        self.annotation_csv_path_edit = QLineEdit(annotation_group)
+        self.annotation_csv_path_edit.setPlaceholderText("Optional existing CSV path for this source")
+        annotation_form.addRow("Load From", self.annotation_csv_path_edit)
+
+        self.output_csv_edit = QLineEdit(annotation_group)
         self.output_csv_edit.setReadOnly(True)
-        output_form.addRow("CSV", self.output_csv_edit)
-        layout.addLayout(output_form)
+        annotation_form.addRow("Active CSV", self.output_csv_edit)
+        annotation_layout.addLayout(annotation_form)
 
-        self.open_result_folder_btn = QPushButton("Open Result Folder", group)
-        self.save_csv_btn = QPushButton("Save CSV Now", group)
-        layout.addWidget(self._row_widget(self.open_result_folder_btn, self.save_csv_btn))
+        self.browse_annotation_csv_btn = QPushButton("Browse CSV", annotation_group)
+        self.load_annotation_csv_btn = QPushButton("Load CSV", annotation_group)
+        self.use_source_csv_btn = QPushButton("Use Source CSV", annotation_group)
+        annotation_layout.addWidget(
+            self._row_widget(self.browse_annotation_csv_btn, self.load_annotation_csv_btn, self.use_source_csv_btn)
+        )
+
+        self.open_result_folder_btn = QPushButton("Open Result Folder", annotation_group)
+        self.save_csv_btn = QPushButton("Save CSV Now", annotation_group)
+        annotation_layout.addWidget(self._row_widget(self.open_result_folder_btn, self.save_csv_btn))
+
+        layout.addWidget(annotation_group)
         return group
 
     def _build_prompt_group(self, parent: QWidget) -> QGroupBox:
@@ -783,6 +819,10 @@ class MainWindow(QMainWindow):
         self.reload_config_btn.clicked.connect(self._reload_dataset_config)
         self.open_video_btn.clicked.connect(self._choose_video)
         self.open_folder_btn.clicked.connect(self._choose_image_folder)
+        self.annotation_csv_path_edit.textChanged.connect(self._on_annotation_csv_path_changed)
+        self.browse_annotation_csv_btn.clicked.connect(self._browse_annotation_csv)
+        self.load_annotation_csv_btn.clicked.connect(self._load_selected_annotation_csv)
+        self.use_source_csv_btn.clicked.connect(self._use_source_csv)
         self.open_result_folder_btn.clicked.connect(self._open_result_folder)
         self.save_csv_btn.clicked.connect(self._save_csv_now)
 
@@ -1413,6 +1453,9 @@ class MainWindow(QMainWindow):
         self._load_dataset_config(initial=False)
         self._refresh_info_panel()
 
+    def _on_annotation_csv_path_changed(self) -> None:
+        self._update_action_states()
+
     def _on_source_mode_changed(self) -> None:
         if self._source_ui_guard:
             return
@@ -1549,27 +1592,45 @@ class MainWindow(QMainWindow):
             active_source_path=source_path,
         )
 
-    def _activate_provider(
+    @staticmethod
+    def _ensure_blank_csv_exists(path: Path) -> None:
+        resolved = Path(path).resolve()
+        if resolved.exists():
+            return
+        CSVStore(resolved, backup_enabled=False).save_records([])
+
+    def _activate_csv_session(
         self,
-        provider: ImageFolderFrameProvider | VideoFrameProvider,
-        source_context: SourceContext,
         output_path: Path,
         active_source_path: Path,
+        *,
+        selected_csv_path: Path | None = None,
+        ensure_blank_source_csv: bool = False,
+        reset_frame_index: bool = False,
     ) -> None:
-        self._close_provider()
-        self.current_provider = provider
-        self.current_source_context = source_context
-        stage, active_csv_path, records = self.postprocess_session.activate(output_path)
+        resolved_output_path = Path(output_path).resolve()
+        resolved_source_path = Path(active_source_path).resolve()
+        resolved_selected_csv = Path(selected_csv_path).resolve() if selected_csv_path is not None else None
+        if ensure_blank_source_csv and resolved_selected_csv is None:
+            self._ensure_blank_csv_exists(resolved_output_path)
+
+        stage, active_csv_path, records = self.postprocess_session.activate(
+            resolved_output_path,
+            selected_csv_path=resolved_selected_csv,
+        )
+        self.current_source_output_csv_path = resolved_output_path
+        self.current_annotation_csv_override_path = resolved_selected_csv
         self.current_raw_csv_path = self.postprocess_session.raw_path
         self.current_latest_csv_path = self.postprocess_session.latest_path
         self.current_output_csv_path = active_csv_path.resolve()
         self.current_result_dir = self.current_output_csv_path.parent
-        self.active_source_path_edit.setText(str(active_source_path))
-        self.output_csv_edit.setText(str(self.current_output_csv_path))
+        self.current_active_source_path = resolved_source_path
+        self.active_source_path_edit.setText(str(resolved_source_path))
 
         self.stage_label.setText(f"Stage: {stage.value}")
         self.records = records
-        self.current_frame_index = 0
+        if reset_frame_index:
+            self.current_frame_index = 0
         self._sync_frame_controls()
         self._load_csv_side_inputs()
         self._refresh_output_path_display()
@@ -1580,6 +1641,98 @@ class MainWindow(QMainWindow):
         self._refresh_info_panel()
         self._update_action_states()
 
+    def _browse_annotation_csv(self) -> None:
+        if self._is_background_task_running():
+            self._show_warning("Run in Progress", "Cancel the active run before loading another CSV.")
+            return
+        initial_path = self.annotation_csv_path_edit.text().strip()
+        if initial_path:
+            start_dir = str(Path(initial_path).resolve().parent)
+        elif self.current_result_dir is not None:
+            start_dir = str(self.current_result_dir)
+        else:
+            start_dir = str(Path.home())
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Annotation CSV",
+            start_dir,
+            "CamLabel3D CSV (*.csv);;All Files (*)",
+        )
+        if path:
+            self.annotation_csv_path_edit.setText(path)
+
+    def _load_selected_annotation_csv(self) -> None:
+        if self._is_background_task_running():
+            self._show_warning("Run in Progress", "Cancel the active run before loading another CSV.")
+            return
+        if self.current_provider is None or self.current_active_source_path is None:
+            self._show_warning("No Source", "Load a dataset, video, or image folder first.")
+            return
+        if self.current_source_output_csv_path is None:
+            self._show_warning("No Default CSV", "The current source does not have a resolved CSV path yet.")
+            return
+        raw_path = self.annotation_csv_path_edit.text().strip()
+        if not raw_path:
+            self._show_warning("No CSV Path", "Enter or browse for an existing CSV file first.")
+            return
+        selected_csv_path = Path(raw_path).resolve()
+        if not selected_csv_path.exists() or not selected_csv_path.is_file():
+            self._show_warning("CSV Not Found", f"Annotation CSV not found:\n{selected_csv_path}")
+            return
+        try:
+            self._activate_csv_session(
+                self.current_source_output_csv_path,
+                self.current_active_source_path,
+                selected_csv_path=selected_csv_path,
+                ensure_blank_source_csv=False,
+                reset_frame_index=False,
+            )
+        except Exception as exc:
+            self._show_warning("CSV Load Failed", str(exc))
+            return
+        self.statusBar().showMessage(f"Loaded annotation CSV: {selected_csv_path}", 5000)
+
+    def _use_source_csv(self) -> None:
+        if self._is_background_task_running():
+            self._show_warning("Run in Progress", "Cancel the active run before switching CSV.")
+            return
+        if self.current_provider is None or self.current_active_source_path is None:
+            self._show_warning("No Source", "Load a dataset, video, or image folder first.")
+            return
+        if self.current_source_output_csv_path is None:
+            self._show_warning("No Default CSV", "The current source does not have a resolved CSV path yet.")
+            return
+        try:
+            self._activate_csv_session(
+                self.current_source_output_csv_path,
+                self.current_active_source_path,
+                selected_csv_path=None,
+                ensure_blank_source_csv=True,
+                reset_frame_index=False,
+            )
+        except Exception as exc:
+            self._show_warning("CSV Load Failed", str(exc))
+            return
+        self.statusBar().showMessage("Switched to the source-derived annotation CSV.", 5000)
+
+    def _activate_provider(
+        self,
+        provider: ImageFolderFrameProvider | VideoFrameProvider,
+        source_context: SourceContext,
+        output_path: Path,
+        active_source_path: Path,
+    ) -> None:
+        self._close_provider()
+        self.current_provider = provider
+        self.current_source_context = source_context
+        self._activate_csv_session(
+            output_path,
+            active_source_path,
+            selected_csv_path=None,
+            ensure_blank_source_csv=True,
+            reset_frame_index=True,
+        )
+
     def _deactivate_source(self, clear_manual_path: bool) -> None:
         self._close_provider()
         self.postprocess_session.clear()
@@ -1588,11 +1741,15 @@ class MainWindow(QMainWindow):
         self.current_raw_csv_path = None
         self.current_latest_csv_path = None
         self.current_output_csv_path = None
+        self.current_source_output_csv_path = None
         self.records = []
         self.current_frame_index = 0
         self.current_frame_det_ids = []
         self.current_track_ids = []
+        self.current_active_source_path = None
+        self.current_annotation_csv_override_path = None
         self.active_source_path_edit.clear()
+        self.annotation_csv_path_edit.clear()
         self.output_csv_edit.clear()
         if clear_manual_path:
             self.manual_source_path = None
@@ -2056,6 +2213,11 @@ class MainWindow(QMainWindow):
 
     def _load_csv_side_inputs(self) -> None:
         self.stage_label.setText(f"Stage: {self._current_stage().value}")
+        with QSignalBlocker(self.annotation_csv_path_edit):
+            if self.current_annotation_csv_override_path is not None:
+                self.annotation_csv_path_edit.setText(str(self.current_annotation_csv_override_path))
+            else:
+                self.annotation_csv_path_edit.clear()
         self._update_action_states()
 
     def _save_csv_now(self) -> None:
@@ -2650,6 +2812,14 @@ class MainWindow(QMainWindow):
         self.run_current_btn.setEnabled(has_source and detection_stage and not running)
         self.run_range_btn.setEnabled(has_source and detection_stage and not running)
         self.cancel_run_btn.setEnabled(detection_running or tracking_running)
+        self.annotation_csv_path_edit.setEnabled(not running)
+        self.browse_annotation_csv_btn.setEnabled(not running)
+        self.load_annotation_csv_btn.setEnabled(
+            has_source and not running and bool(self.annotation_csv_path_edit.text().strip())
+        )
+        self.use_source_csv_btn.setEnabled(
+            has_source and not running and self.current_source_output_csv_path is not None
+        )
         self.save_csv_btn.setEnabled(has_source and not running)
         self.open_result_folder_btn.setEnabled(self.current_result_dir is not None)
 

@@ -61,6 +61,36 @@ class PostprocessSessionTests(unittest.TestCase):
             self.assertTrue(str(latest_path).endswith(".latest.camlabel3d.csv"))
             self.assertEqual(len(latest_records), 1)
 
+    def test_activate_selected_latest_csv_enters_postprocessing_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            raw_path = Path(tmp_dir) / "demo.camlabel3d.csv"
+            latest_path = Path(tmp_dir) / "demo.latest.camlabel3d.csv"
+            CSVStore(raw_path, backup_enabled=False).save_records([make_record(track_id="1")])
+            CSVStore(latest_path, backup_enabled=False).save_records([make_record(track_id="7")])
+
+            session = PostprocessSession()
+            stage, active_path, records = session.activate(raw_path, selected_csv_path=latest_path)
+
+            self.assertEqual(stage, WorkflowStage.POSTPROCESSING)
+            self.assertEqual(active_path, latest_path.resolve())
+            self.assertEqual(session.raw_path, raw_path.resolve())
+            self.assertEqual(session.latest_path, latest_path.resolve())
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0].track_id, "7")
+
+    def test_blank_raw_csv_does_not_enable_postprocessing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            raw_path = Path(tmp_dir) / "blank.camlabel3d.csv"
+            CSVStore(raw_path, backup_enabled=False).save_records([])
+
+            session = PostprocessSession()
+            stage, active_path, records = session.activate(raw_path)
+
+            self.assertEqual(stage, WorkflowStage.DETECTION)
+            self.assertEqual(active_path, raw_path.resolve())
+            self.assertEqual(records, [])
+            self.assertFalse(session.can_start_postprocessing(records))
+
     def test_reset_to_raw_restores_original_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             raw_path = Path(tmp_dir) / "demo.camlabel3d.csv"
