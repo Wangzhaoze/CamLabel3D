@@ -91,6 +91,22 @@ class PostprocessSessionTests(unittest.TestCase):
             self.assertEqual(records, [])
             self.assertFalse(session.can_start_postprocessing(records))
 
+    def test_configure_source_does_not_auto_load_latest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            raw_path = Path(tmp_dir) / "demo.camlabel3d.csv"
+            latest_path = Path(tmp_dir) / "demo.latest.camlabel3d.csv"
+            CSVStore(raw_path, backup_enabled=False).save_records([make_record(track_id="1")])
+            CSVStore(latest_path, backup_enabled=False).save_records([make_record(track_id="7")])
+
+            session = PostprocessSession()
+            stage, active_path = session.configure_source(raw_path)
+
+            self.assertEqual(stage, WorkflowStage.DETECTION)
+            self.assertEqual(active_path, raw_path.resolve())
+            self.assertEqual(session.raw_path, raw_path.resolve())
+            self.assertEqual(session.latest_path, latest_path.resolve())
+            self.assertEqual(session.active_path, raw_path.resolve())
+
     def test_reset_to_raw_restores_original_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             raw_path = Path(tmp_dir) / "demo.camlabel3d.csv"
@@ -116,6 +132,7 @@ class PostprocessSessionTests(unittest.TestCase):
         disabled = session.apply_filter(records, FilterConfig(min_score=0.5))
         self.assertEqual(disabled, 1)
         self.assertFalse(records[1].is_enabled)
+        self.assertFalse(records[1].is_visible)
 
         locked = session.lock_track(records, "1")
         self.assertEqual(locked, 1)
@@ -134,6 +151,19 @@ class PostprocessSessionTests(unittest.TestCase):
         self.assertEqual(len(summaries), 1)
         self.assertEqual(summaries[0].track_id, "1")
         self.assertEqual(summaries[0].enabled_count, 2)
+
+    def test_delete_track_disables_and_hides_rows(self) -> None:
+        records = [
+            make_record(frame_index=0, track_id="9", track_status="auto"),
+            make_record(frame_index=1, track_id="9", track_status="auto"),
+        ]
+        session = PostprocessSession()
+
+        disabled = session.delete_track(records, "9")
+
+        self.assertEqual(disabled, 2)
+        self.assertTrue(all(not record.is_enabled for record in records))
+        self.assertTrue(all(not record.is_visible for record in records))
 
 
 if __name__ == "__main__":

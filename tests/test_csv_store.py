@@ -71,6 +71,21 @@ class CSVStoreTests(unittest.TestCase):
             self.assertEqual(loaded[0].source_id, "")
             self.assertEqual(loaded[0].prompt_payload_json, "")
             self.assertTrue(bool(loaded[0].det_id))
+            self.assertTrue(loaded[0].is_visible)
+
+    def test_runtime_visibility_defaults_to_enabled_without_persisting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            csv_path = Path(tmp_dir) / "results.csv"
+            store = CSVStore(csv_path)
+            record = make_record()
+            record.is_visible = False
+            store.save_records([record])
+
+            loaded = store.load_records()
+
+            self.assertEqual(len(loaded), 1)
+            self.assertTrue(loaded[0].is_enabled)
+            self.assertTrue(loaded[0].is_visible)
 
     def test_second_save_creates_backup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

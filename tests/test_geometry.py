@@ -7,6 +7,7 @@ import numpy as np
 from camlabel3d.core.detector import DetectorAdapter
 from camlabel3d.core.geometry import (
     box10_quaternion_to_corners,
+    boxes10_quaternion_to_corners,
     project_box3d_heading_line,
     project_points_opencv,
 )
@@ -14,6 +15,30 @@ from camlabel3d.core.models import DetectionRecord
 
 
 class GeometryTests(unittest.TestCase):
+    def test_vectorized_corners_match_vis4d_opencv_convention(self) -> None:
+        try:
+            import torch
+            from vis4d.data.const import AxisMode
+            from vis4d.op.box.box3d import boxes3d_to_corners
+        except ImportError:
+            self.skipTest("vis4d reference implementation is unavailable")
+
+        rng = np.random.default_rng(20260715)
+        boxes = np.empty((32, 10), dtype=np.float64)
+        boxes[:, :3] = rng.uniform([-5.0, -2.0, 3.0], [5.0, 2.0, 30.0], size=(32, 3))
+        boxes[:, 3:6] = rng.uniform(0.2, 6.0, size=(32, 3))
+        quaternions = rng.normal(size=(32, 4))
+        quaternions /= np.linalg.norm(quaternions, axis=1, keepdims=True)
+        boxes[:, 6:10] = quaternions
+
+        expected = boxes3d_to_corners(
+            torch.tensor(boxes, dtype=torch.float64),
+            AxisMode.OPENCV,
+        ).cpu().numpy()
+        actual = boxes10_quaternion_to_corners(boxes)
+
+        np.testing.assert_allclose(actual, expected, rtol=1e-10, atol=1e-10)
+
     def test_euler_roundtrip_keeps_box_orientation(self) -> None:
         record = DetectionRecord(
             frame_index=0,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Callable, Iterable, Sequence
@@ -114,21 +115,34 @@ class ProcessingContext:
     selected_track_id: str = ""
     track_summaries: list[TrackSummary] = field(default_factory=list)
     reproject_record: Callable[[DetectionRecord], None] | None = None
+    _enabled_tracked_cache: list[DetectionRecord] | None = field(default=None, init=False, repr=False)
+    _track_groups_cache: dict[str, list[DetectionRecord]] | None = field(default=None, init=False, repr=False)
+    _records_by_id_cache: dict[str, DetectionRecord] | None = field(default=None, init=False, repr=False)
 
     def enabled_tracked_records(self) -> list[DetectionRecord]:
-        return [
-            record
-            for record in self.records
-            if record.is_enabled and str(record.track_id).strip()
-        ]
+        if self._enabled_tracked_cache is None:
+            self._enabled_tracked_cache = [
+                record
+                for record in self.records
+                if record.is_enabled and str(record.track_id).strip()
+            ]
+        return self._enabled_tracked_cache
 
     def track_groups(self) -> dict[str, list[DetectionRecord]]:
+        if self._track_groups_cache is not None:
+            return self._track_groups_cache
         grouped: dict[str, list[DetectionRecord]] = {}
         for record in self.enabled_tracked_records():
             grouped.setdefault(record.track_id.strip(), []).append(record)
         for track_id, group in grouped.items():
             grouped[track_id] = sorted(group, key=lambda item: (item.frame_index, item.det_id))
+        self._track_groups_cache = grouped
         return grouped
+
+    def record_by_id(self, det_id: str) -> DetectionRecord | None:
+        if self._records_by_id_cache is None:
+            self._records_by_id_cache = {record.det_id: record for record in self.records}
+        return self._records_by_id_cache.get(str(det_id))
 
     def target_records(self, scope: ProcessingScope) -> list[DetectionRecord]:
         tracked = self.enabled_tracked_records()
@@ -204,7 +218,7 @@ class OutlierRule:
 
     rule_id = ""
     display_name = ""
-    default_enabled = True
+    default_enabled = False
     supported_scopes = (
         ProcessingScope.CURRENT_FRAME,
         ProcessingScope.SELECTED_TRACK,
@@ -314,9 +328,11 @@ class ProcessingEngine:
         self,
         outlier_registry: OutlierRuleRegistry | None = None,
         bulk_operation_registry: BulkOperationRegistry | None = None,
+        max_workers: int = 1,
     ) -> None:
         self.outlier_registry = outlier_registry or build_default_outlier_registry()
         self.bulk_operation_registry = bulk_operation_registry or build_default_bulk_operation_registry()
+        self.max_workers = max(1, int(max_workers))
 
     def analyze_outliers(
         self,
@@ -325,12 +341,29 @@ class ProcessingEngine:
         enabled_rule_ids: Iterable[str],
         params_by_rule: dict[str, dict[str, float | int]] | None,
         context: ProcessingContext,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> list[OutlierHit]:
-        hits: list[OutlierHit] = []
-        for rule_id in enabled_rule_ids:
+        rule_ids = list(enabled_rule_ids)
+        # Materialize shared read indexes once before optional parallel rule
+        # evaluation, avoiding duplicate grouping and benign cache races.
+        context.track_groups()
+        context.record_by_id("")
+
+        def analyze_rule(rule_id: str) -> list[OutlierHit]:
+            if should_cancel and should_cancel():
+                return []
             rule = self.outlier_registry.get(rule_id)
             params = (params_by_rule or {}).get(rule_id)
-            hits.extend(rule.analyze(records, scope, context, params))
+            return rule.analyze(records, scope, context, params)
+
+        if self.max_workers > 1 and len(rule_ids) > 1:
+            worker_count = min(self.max_workers, len(rule_ids))
+            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="outlier-rule") as executor:
+                grouped_hits = list(executor.map(analyze_rule, rule_ids))
+        else:
+            grouped_hits = [analyze_rule(rule_id) for rule_id in rule_ids]
+
+        hits = [hit for rule_hits in grouped_hits for hit in rule_hits]
         hits.sort(key=lambda hit: hit.sort_key())
         return hits
 
@@ -762,7 +795,7 @@ class EulerAngleSpikeRule(OutlierRule):
         affected: list[str] = []
         angle_label = self._ANGLE_LABELS[self.axis_name]
         for hit in hits:
-            record = next((item for item in records if item.det_id == hit.det_id), None)
+            record = context.record_by_id(hit.det_id)
             if record is None:
                 continue
             target_angle = float(hit.metadata.get("expected_angle_temporal_deg", getattr(record, self.angle_field)))
@@ -844,7 +877,7 @@ class SizeSpikeRule(OutlierRule):
         updated = 0
         affected: list[str] = []
         for hit in hits:
-            record = next((item for item in records if item.det_id == hit.det_id), None)
+            record = context.record_by_id(hit.det_id)
             if record is None:
                 continue
             ref_w = float(hit.metadata.get("ref_size_w", record.size_w))
@@ -936,7 +969,7 @@ class CenterSpikeRule(OutlierRule):
         updated = 0
         affected: list[str] = []
         for hit in hits:
-            record = next((item for item in records if item.det_id == hit.det_id), None)
+            record = context.record_by_id(hit.det_id)
             if record is None:
                 continue
             pred_x = float(hit.metadata.get("pred_center_x", record.center_x))

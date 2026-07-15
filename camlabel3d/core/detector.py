@@ -2,34 +2,52 @@
 
 from __future__ import annotations
 
+import gc
 import traceback
 import uuid
-import gc
+from contextlib import nullcontext
 from pathlib import Path
-from threading import Condition
+from threading import Condition, Lock
 from typing import Any, Callable
 
 import numpy as np
 from PIL import Image
 
+from camlabel3d.diagnostics.gpu import format_result, run_gpu_diagnostic_isolated
 from camlabel3d.runtime import default_checkpoint_path, ensure_wilddet3d_on_path
+from camlabel3d.runtime_config import RuntimeConfig
 
 from .frame_provider import FrameProvider
 from .geometry import (
+    Box3DOverlay,
     box10_quaternion_to_box9d,
     box9d_to_box10_quaternion,
-    draw_box3d_overlay,
-    draw_box3d_heading_overlay,
     project_box3d_quaternion_to_2d_bounds,
+    render_box3d_scene_rgb,
 )
 from .models import (
     DetectionConfig,
     DetectionRecord,
-    PointPrompt,
     PromptMode,
     PromptSpec,
     SourceContext,
     SourceMode,
+)
+
+
+_PREVIEW_CATEGORY_COLORS: tuple[tuple[int, int, int], ...] = (
+    (66, 165, 245),
+    (255, 159, 67),
+    (46, 204, 113),
+    (238, 90, 111),
+    (165, 94, 234),
+    (38, 222, 190),
+    (255, 206, 84),
+    (84, 160, 255),
+    (255, 107, 129),
+    (72, 219, 251),
+    (29, 209, 161),
+    (190, 190, 190),
 )
 
 
@@ -40,13 +58,20 @@ class DetectorAdapter:
         self,
         checkpoint_path: str | Path | None = None,
         device: str | None = None,
+        runtime_config: RuntimeConfig | None = None,
     ) -> None:
+        self.runtime_config = runtime_config or RuntimeConfig.from_env()
         self.checkpoint_path = Path(checkpoint_path or default_checkpoint_path()).resolve()
-        self.device = device
+        self.device = device or self.runtime_config.device
         self._models: dict[bool, Any] = {}
         self._build_error: str | None = None
         self._model_condition = Condition()
         self._building_variant: bool | None = None
+        self._resolved_device: str | None = None
+        self._torch_configured = False
+        self._cuda_preflight_lock = Lock()
+        self._cuda_preflight_device: str | None = None
+        self._cuda_preflight_error: str | None = None
 
     def run_range(
         self,
@@ -186,95 +211,77 @@ class DetectorAdapter:
         highlight_det_id: str | None = None,
         intrinsics_override: np.ndarray | None = None,
     ) -> Image.Image:
-        active_records = [record for record in records if record.is_enabled]
-        highlighted_record = next(
-            (
-                record
-                for record in active_records
-                if highlight_det_id and record.det_id == highlight_det_id
-            ),
-            None,
-        )
-        draw_records = [
-            record
-            for record in active_records
-            if highlighted_record is None or record.det_id != highlighted_record.det_id
-        ]
-        if not active_records:
-            preview = Image.fromarray(frame_rgb.astype(np.uint8))
-        else:
-            ensure_wilddet3d_on_path()
-            from wilddet3d.vis.visualize import draw_3d_boxes
+        """Compatibility wrapper around the direct RGB preview renderer."""
 
-            categories = sorted({record.category for record in draw_records}) if draw_records else []
-            category_to_id = {name: index for index, name in enumerate(categories)}
-            boxes3d = np.array(
-                [self.record_to_box3d_quaternion(record) for record in draw_records],
+        return Image.fromarray(
+            self.render_frame_preview_rgb(
+                frame_rgb=frame_rgb,
+                records=records,
+                prompt_spec=prompt_spec,
+                highlight_det_id=highlight_det_id,
+                intrinsics_override=intrinsics_override,
+            )
+        )
+
+    def render_frame_preview_rgb(
+        self,
+        frame_rgb: np.ndarray,
+        records: list[DetectionRecord],
+        prompt_spec: PromptSpec | None = None,
+        highlight_det_id: str | None = None,
+        intrinsics_override: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Draw all visible 3D boxes in one CPU-efficient full-frame pass."""
+
+        active_records = [record for record in records if record.is_visible]
+        intrinsics = intrinsics_override
+        if intrinsics is None and active_records:
+            intrinsics = active_records[0].intrinsics_for_preview(frame_rgb.shape[:2])
+        if intrinsics is None:
+            height, width = frame_rgb.shape[:2]
+            focal = float(max(height, width))
+            intrinsics = np.array(
+                [[focal, 0.0, width / 2.0], [0.0, focal, height / 2.0], [0.0, 0.0, 1.0]],
                 dtype=np.float32,
             )
-            scores_2d = np.array([record.score_2d for record in draw_records], dtype=np.float32)
-            scores_3d = np.array([record.score_3d for record in draw_records], dtype=np.float32)
-            class_ids = np.array([category_to_id[record.category] for record in draw_records], dtype=np.int64)
-            intrinsics = intrinsics_override
-            if intrinsics is None:
-                intrinsics = active_records[0].intrinsics_for_preview(frame_rgb.shape[:2])
-            input_boxes = [list(prompt_spec.box)] if prompt_spec and prompt_spec.box else None
-            input_points = (
-                [[point.to_tuple() for point in prompt_spec.points]]
-                if prompt_spec and prompt_spec.points
-                else None
-            )
-            if len(draw_records) > 0:
-                preview = draw_3d_boxes(
-                    image=frame_rgb.astype(np.uint8),
-                    boxes3d=boxes3d,
-                    intrinsics=intrinsics,
-                    scores_2d=scores_2d,
-                    scores_3d=scores_3d,
-                    class_ids=class_ids,
-                    class_names=categories,
-                    input_boxes=input_boxes,
-                    input_points=input_points,
-                    draw_prompt=bool(prompt_spec and (prompt_spec.box or prompt_spec.points)),
-                    score_2d_threshold=0.0,
-                    score_3d_threshold=0.0,
-                )
-            else:
-                preview = draw_3d_boxes(
-                    image=frame_rgb.astype(np.uint8),
-                    boxes3d=np.zeros((0, 10), dtype=np.float32),
-                    intrinsics=intrinsics,
-                    input_boxes=input_boxes,
-                    input_points=input_points,
-                    draw_prompt=bool(prompt_spec and (prompt_spec.box or prompt_spec.points)),
-                    score_2d_threshold=0.0,
-                    score_3d_threshold=0.0,
-                )
 
-            if highlighted_record is not None:
-                preview = draw_box3d_overlay(
-                    image=preview,
-                    box3d=self.record_to_box3d_quaternion(highlighted_record),
-                    intrinsics=intrinsics,
-                    color_rgb=(32, 255, 32),
-                    line_width=3,
-                )
-                preview = draw_box3d_heading_overlay(
-                    image=preview,
-                    box3d=self.record_to_box3d_quaternion(highlighted_record),
-                    intrinsics=intrinsics,
-                    color_rgb=(32, 255, 32),
-                    line_width=3,
-                )
-            for record in draw_records:
-                preview = draw_box3d_heading_overlay(
-                    image=preview,
+        categories = sorted({record.category for record in active_records})
+        category_colors = {
+            category: _PREVIEW_CATEGORY_COLORS[offset % len(_PREVIEW_CATEGORY_COLORS)]
+            for offset, category in enumerate(categories)
+        }
+        overlays: list[Box3DOverlay] = []
+        for record in active_records:
+            highlighted = bool(highlight_det_id and record.det_id == highlight_det_id)
+            color = (32, 255, 32) if highlighted else category_colors[record.category]
+            overlays.append(
+                Box3DOverlay(
                     box3d=self.record_to_box3d_quaternion(record),
-                    intrinsics=intrinsics,
-                    color_rgb=(88, 190, 255),
-                    line_width=2,
+                    color_rgb=color,
+                    line_width=3 if highlighted else 2,
+                    draw_edges=True,
+                    draw_heading=True,
+                    label=(
+                        f"{record.category} "
+                        f"2D:{float(record.score_2d):.2f} "
+                        f"3D:{float(record.score_3d):.2f}"
+                    ),
+                    heading_color_rgb=color if highlighted else (88, 190, 255),
                 )
-        return preview
+            )
+
+        prompt_box = prompt_spec.box if prompt_spec and prompt_spec.box else None
+        prompt_points = (
+            (point.x, point.y, point.label)
+            for point in (prompt_spec.points if prompt_spec else ())
+        )
+        return render_box3d_scene_rgb(
+            image_rgb=frame_rgb,
+            overlays=overlays,
+            intrinsics=intrinsics,
+            prompt_box=prompt_box,
+            prompt_points=prompt_points,
+        )
 
     @staticmethod
     def record_to_box3d_quaternion(record: DetectionRecord) -> np.ndarray:
@@ -318,12 +325,15 @@ class DetectorAdapter:
                 self._model_condition.wait()
             models = list(self._models.values())
             self._models = {}
+        if not models:
+            return
+        self._dispose_models(models)
 
-        for model in models:
-            try:
-                del model
-            except Exception:
-                pass
+    @staticmethod
+    def _dispose_models(models: list[Any]) -> None:
+        """Drop all strong references before asking CUDA to release its cache."""
+
+        models.clear()
         gc.collect()
         try:
             import torch
@@ -339,6 +349,7 @@ class DetectorAdapter:
         if not self.checkpoint_path.exists():
             raise FileNotFoundError(f"WildDet3D checkpoint not found: {self.checkpoint_path}")
 
+        stale_models: list[Any] = []
         with self._model_condition:
             if use_predicted_intrinsics in self._models:
                 return self._models[use_predicted_intrinsics]
@@ -351,12 +362,27 @@ class DetectorAdapter:
                     self._model_condition.wait()
                     if use_predicted_intrinsics in self._models:
                         return self._models[use_predicted_intrinsics]
+            # Only one 4+ GB variant is retained. Releasing it before building
+            # another avoids a transient two-model VRAM peak on 12 GB cards.
+            stale_models = list(self._models.values())
+            self._models = {}
             self._building_variant = use_predicted_intrinsics
 
-        ensure_wilddet3d_on_path()
-        from wilddet3d.inference import build_model
-
         try:
+            if stale_models:
+                self._dispose_models(stale_models)
+
+            # Everything after publishing ``_building_variant`` must stay in
+            # this guarded section.  Import/toolchain failures are just as
+            # capable of occurring as model construction failures; leaving the
+            # flag set would make every waiter (including application shutdown)
+            # block forever.
+            ensure_wilddet3d_on_path()
+            resolved_device = self._resolve_device()
+            self._ensure_cuda_runtime_ready(resolved_device)
+            from wilddet3d.inference import build_model
+
+            self._configure_torch_runtime()
             model = build_model(
                 checkpoint=str(self.checkpoint_path),
                 score_threshold=0.0,
@@ -364,7 +390,7 @@ class DetectorAdapter:
                 canonical_rotation=True,
                 skip_pretrained=True,
                 use_predicted_intrinsics=use_predicted_intrinsics,
-                device=self._resolve_device(),
+                device=resolved_device,
             )
         except Exception as exc:  # pragma: no cover - runtime dependency path
             self._build_error = "".join(traceback.format_exception(exc))
@@ -375,22 +401,107 @@ class DetectorAdapter:
 
         with self._model_condition:
             self._models = {use_predicted_intrinsics: model}
+            self._build_error = None
             self._building_variant = None
             self._model_condition.notify_all()
             return model
 
     def _resolve_device(self) -> str:
-        if self.device:
-            return self.device
+        if self._resolved_device is not None:
+            return self._resolved_device
+        requested = str(self.device or "auto").strip().lower()
         try:
             import torch
         except ImportError:
-            return "cpu"
-        return "cuda" if torch.cuda.is_available() else "cpu"
+            if requested not in {"", "auto", "cpu"}:
+                raise RuntimeError(f"Requested device '{requested}' requires PyTorch.")
+            self._resolved_device = "cpu"
+            return self._resolved_device
+
+        if requested in {"", "auto"}:
+            self._resolved_device = "cuda" if torch.cuda.is_available() else "cpu"
+        elif requested.startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError(
+                f"Requested device '{requested}', but CUDA is unavailable. "
+                "Set CAMLABEL3D_DEVICE=cpu or install a compatible CUDA build."
+            )
+        else:
+            self._resolved_device = requested
+        return self._resolved_device
+
+    @staticmethod
+    def _cuda_device_index(device: str) -> int | None:
+        if device == "cuda":
+            return None
+        prefix, separator, raw_index = device.partition(":")
+        if prefix != "cuda" or not separator or not raw_index:
+            raise RuntimeError(
+                f"Invalid CUDA device '{device}'. Use 'cuda' or an indexed device such as 'cuda:0'."
+            )
+        try:
+            index = int(raw_index)
+        except ValueError as error:
+            raise RuntimeError(
+                f"Invalid CUDA device '{device}'. The CUDA device index must be an integer."
+            ) from error
+        if index < 0:
+            raise RuntimeError(f"Invalid CUDA device '{device}'. The CUDA device index cannot be negative.")
+        return index
+
+    def _ensure_cuda_runtime_ready(self, device: str) -> None:
+        """Validate the extension once before this adapter uses a CUDA device."""
+        if not device.startswith("cuda"):
+            return
+        with self._cuda_preflight_lock:
+            if self._cuda_preflight_device == device:
+                if self._cuda_preflight_error is not None:
+                    raise RuntimeError(self._cuda_preflight_error)
+                return
+
+            # Keep extension discovery ahead of model imports. The isolated
+            # child inherits the amended path and imports the extension itself.
+            ensure_wilddet3d_on_path()
+            device_index = self._cuda_device_index(device)
+            result = run_gpu_diagnostic_isolated(device_index)
+            self._cuda_preflight_device = device
+            if result.ok:
+                self._cuda_preflight_error = None
+                return
+
+            diagnostic_command = "python -m camlabel3d.diagnostics.gpu"
+            if device_index is not None:
+                diagnostic_command += f" --device {device_index}"
+            self._cuda_preflight_error = (
+                f"CUDA compatibility check failed for '{device}' before the WildDet3D model was loaded.\n"
+                f"{format_result(result)}\n"
+                f"Diagnostic command: {diagnostic_command}\n"
+                "After repairing or rebuilding vis4d_cuda_ops, restart CamLabel3D before retrying."
+            )
+            raise RuntimeError(self._cuda_preflight_error)
+
+    def _configure_torch_runtime(self) -> None:
+        if self._torch_configured:
+            return
+        try:
+            import torch
+        except ImportError:
+            self._torch_configured = True
+            return
+        torch.set_num_threads(max(1, int(self.runtime_config.torch_threads)))
+        try:
+            torch.set_num_interop_threads(max(1, int(self.runtime_config.torch_interop_threads)))
+        except RuntimeError:
+            # PyTorch only permits setting this before inter-op work starts.
+            pass
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+        self._torch_configured = True
 
     def _run_model(self, model: Any, data: dict[str, Any], prompt_spec: PromptSpec) -> dict[str, Any]:
-        images = data["images"].to(self._resolve_device())
-        intrinsics = data["intrinsics"].to(self._resolve_device())[None]
+        device = self._resolve_device()
+        self._ensure_cuda_runtime_ready(device)
+        images = data["images"].to(device)
+        intrinsics = data["intrinsics"].to(device)[None]
         common_kwargs = {
             "images": images,
             "intrinsics": intrinsics,
@@ -399,28 +510,40 @@ class DetectorAdapter:
             "padding": [data["padding"]],
             "return_predicted_intrinsics": True,
         }
-        if prompt_spec.mode == PromptMode.TEXT:
-            outputs = model(
-                **common_kwargs,
-                input_texts=prompt_spec.parsed_texts(),
-            )
-            class_names = prompt_spec.parsed_texts()
-        elif prompt_spec.mode in (PromptMode.BOX_MULTI, PromptMode.BOX_SINGLE):
-            outputs = model(
-                **common_kwargs,
-                input_boxes=[list(prompt_spec.box)],
-                prompt_text=prompt_spec.prompt_text_for_model(),
-            )
-            class_names = [prompt_spec.class_name_fallback()]
-        elif prompt_spec.mode == PromptMode.POINT:
-            outputs = model(
-                **common_kwargs,
-                input_points=[[point.to_tuple() for point in prompt_spec.points]],
-                prompt_text=prompt_spec.prompt_text_for_model(),
-            )
-            class_names = [prompt_spec.class_name_fallback()]
+        inference_context = nullcontext()
+        autocast_context = nullcontext()
+        try:
+            import torch
+        except ImportError:
+            pass
         else:
-            raise ValueError(f"Unsupported prompt mode: {prompt_spec.mode}")
+            inference_context = torch.inference_mode()
+            if self.runtime_config.enable_amp and device.startswith("cuda"):
+                autocast_context = torch.autocast(device_type="cuda", dtype=torch.float16)
+
+        with inference_context, autocast_context:
+            if prompt_spec.mode == PromptMode.TEXT:
+                outputs = model(
+                    **common_kwargs,
+                    input_texts=prompt_spec.parsed_texts(),
+                )
+                class_names = prompt_spec.parsed_texts()
+            elif prompt_spec.mode in (PromptMode.BOX_MULTI, PromptMode.BOX_SINGLE):
+                outputs = model(
+                    **common_kwargs,
+                    input_boxes=[list(prompt_spec.box)],
+                    prompt_text=prompt_spec.prompt_text_for_model(),
+                )
+                class_names = [prompt_spec.class_name_fallback()]
+            elif prompt_spec.mode == PromptMode.POINT:
+                outputs = model(
+                    **common_kwargs,
+                    input_points=[[point.to_tuple() for point in prompt_spec.points]],
+                    prompt_text=prompt_spec.prompt_text_for_model(),
+                )
+                class_names = [prompt_spec.class_name_fallback()]
+            else:
+                raise ValueError(f"Unsupported prompt mode: {prompt_spec.mode}")
 
         (
             boxes,

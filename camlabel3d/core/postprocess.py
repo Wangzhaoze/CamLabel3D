@@ -74,12 +74,13 @@ def clone_records(records: list[DetectionRecord]) -> list[DetectionRecord]:
 class PostprocessSession:
     """Tracks raw/latest paths, stage, and undo state for one source."""
 
-    def __init__(self) -> None:
+    def __init__(self, undo_limit: int = 20) -> None:
         self.raw_path: Path | None = None
         self.latest_path: Path | None = None
         self.active_path: Path | None = None
         self.stage = WorkflowStage.DETECTION
         self._undo_stack: list[list[DetectionRecord]] = []
+        self.undo_limit = max(1, int(undo_limit))
         self._track_unlock_restore: dict[str, str] = {}
 
     @staticmethod
@@ -112,11 +113,31 @@ class PostprocessSession:
         self.stage = WorkflowStage.DETECTION
         self.clear_undo()
 
+    def configure_source(self, raw_path: str | Path) -> tuple[WorkflowStage, Path]:
+        base_raw_path = Path(raw_path).resolve()
+        self.clear_undo()
+        self.raw_path = base_raw_path
+        self.latest_path = self.derive_latest_path(self.raw_path)
+        self.active_path = self.raw_path
+        self.stage = WorkflowStage.DETECTION
+        return self.stage, self.active_path
+
     def activate(
         self,
         raw_path: str | Path,
         selected_csv_path: str | Path | None = None,
     ) -> tuple[WorkflowStage, Path, list[DetectionRecord]]:
+        stage, active_path = self.configure_activation(raw_path, selected_csv_path)
+        records = self._load_from(active_path) if active_path.exists() else []
+        return stage, active_path, records
+
+    def configure_activation(
+        self,
+        raw_path: str | Path,
+        selected_csv_path: str | Path | None = None,
+    ) -> tuple[WorkflowStage, Path]:
+        """Configure workflow paths without parsing the potentially large CSV."""
+
         base_raw_path = Path(raw_path).resolve()
         self.clear_undo()
 
@@ -133,20 +154,17 @@ class PostprocessSession:
                 self.latest_path = self.derive_latest_path(selected_path)
                 self.stage = WorkflowStage.DETECTION
             self.active_path = selected_path
-            records = self._load_from(selected_path)
-            return self.stage, self.active_path, records
+            return self.stage, self.active_path
 
         self.raw_path = base_raw_path
         self.latest_path = self.derive_latest_path(self.raw_path)
         if self.latest_path.exists():
             self.stage = WorkflowStage.POSTPROCESSING
             self.active_path = self.latest_path
-            records = self._load_from(self.latest_path)
         else:
             self.stage = WorkflowStage.DETECTION
             self.active_path = self.raw_path
-            records = self._load_from(self.raw_path) if self.raw_path.exists() else []
-        return self.stage, self.active_path, records
+        return self.stage, self.active_path
 
     def latest_exists(self) -> bool:
         return bool(self.latest_path and self.latest_path.exists())
@@ -167,10 +185,8 @@ class PostprocessSession:
             CSVStore(self.raw_path, backup_enabled=False).save_records(records)
         self.latest_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(self.raw_path, self.latest_path)
-        self.stage = WorkflowStage.POSTPROCESSING
-        self.active_path = self.latest_path
-        self.clear_undo()
-        return self.latest_path, self._load_from(self.latest_path)
+        active_path = self.commit_postprocessing(clear_undo=True)
+        return active_path, self._load_from(active_path)
 
     def reset_to_raw(self) -> tuple[Path, list[DetectionRecord]]:
         if self.raw_path is None or self.latest_path is None:
@@ -179,21 +195,51 @@ class PostprocessSession:
             raise ValueError("The raw detection CSV does not exist yet.")
         self.latest_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(self.raw_path, self.latest_path)
+        active_path = self.commit_postprocessing(clear_undo=False)
+        return active_path, self._load_from(active_path)
+
+    def postprocessing_paths(self) -> tuple[Path, Path]:
+        """Return a stable raw/latest path pair without changing session state."""
+
+        if self.raw_path is None or self.latest_path is None:
+            raise ValueError("No active source is loaded.")
+        return self.raw_path.resolve(), self.latest_path.resolve()
+
+    def commit_postprocessing(self, *, clear_undo: bool) -> Path:
+        """Commit a completed external CSV transition on the owning thread."""
+
+        if self.latest_path is None:
+            raise ValueError("No active source is loaded.")
         self.stage = WorkflowStage.POSTPROCESSING
         self.active_path = self.latest_path
-        return self.latest_path, self._load_from(self.latest_path)
-
-    def save_records(self, records: list[DetectionRecord]) -> Path:
-        if self.active_path is None:
-            raise ValueError("No active CSV is available for saving.")
-        CSVStore(
-            self.active_path,
-            backup_enabled=self.stage == WorkflowStage.POSTPROCESSING,
-        ).save_records(records)
+        if clear_undo:
+            self.clear_undo()
         return self.active_path
 
-    def push_undo_snapshot(self, snapshot: list[DetectionRecord]) -> None:
-        self._undo_stack.append(clone_records(snapshot))
+    def save_records(self, records: list[DetectionRecord]) -> Path:
+        path, backup_enabled = self.save_target()
+        CSVStore(path, backup_enabled=backup_enabled).save_records(records)
+        return path
+
+    def save_target(self) -> tuple[Path, bool]:
+        """Return the active path and backup policy without performing I/O."""
+
+        if self.active_path is None:
+            raise ValueError("No active CSV is available for saving.")
+        return self.active_path, self.stage == WorkflowStage.POSTPROCESSING
+
+    def push_undo_snapshot(
+        self,
+        snapshot: list[DetectionRecord],
+        *,
+        snapshot_owned: bool = False,
+    ) -> None:
+        """Store a bounded snapshot, optionally taking ownership of a clone."""
+
+        self._undo_stack.append(list(snapshot) if snapshot_owned else clone_records(snapshot))
+        overflow = len(self._undo_stack) - self.undo_limit
+        if overflow > 0:
+            del self._undo_stack[:overflow]
 
     def has_undo(self) -> bool:
         return bool(self._undo_stack)
@@ -214,6 +260,7 @@ class PostprocessSession:
                 continue
             if not config.matches(record):
                 record.is_enabled = False
+                record.is_visible = False
                 disabled += 1
         return disabled
 
@@ -225,6 +272,7 @@ class PostprocessSession:
         for record in records:
             if record.track_id == track_id and record.is_enabled:
                 record.is_enabled = False
+                record.is_visible = False
                 disabled += 1
         if disabled == 0:
             raise ValueError(f"Track '{track_id}' has no enabled detections.")

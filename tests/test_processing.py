@@ -63,12 +63,14 @@ class ProcessingEngineTests(unittest.TestCase):
         self.engine = ProcessingEngine()
 
     def test_default_registries_include_builtin_rules_and_operations(self) -> None:
-        outlier_ids = [rule.rule_id for rule in build_default_outlier_registry().all()]
+        outlier_rules = build_default_outlier_registry().all()
+        outlier_ids = [rule.rule_id for rule in outlier_rules]
         operation_ids = [operation.operation_id for operation in build_default_bulk_operation_registry().all()]
         self.assertEqual(
             outlier_ids,
             ["yaw_spike", "pitch_spike", "roll_spike", "size_spike", "center_spike"],
         )
+        self.assertTrue(all(not rule.default_enabled for rule in outlier_rules))
         self.assertEqual(operation_ids, ["smooth_angles", "fix_track_size", "smooth_track_centers"])
 
     def test_single_record_can_hit_multiple_outlier_rules(self) -> None:

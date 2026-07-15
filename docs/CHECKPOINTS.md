@@ -68,5 +68,6 @@ CamLabel3D/
 Once both files are in place, you can launch the desktop app from the repository root:
 
 ```powershell
-python .\run_camlabel3d_ui.py
+python -m camlabel3d
+# 或使用便捷入口：python .\ui.py
 ```

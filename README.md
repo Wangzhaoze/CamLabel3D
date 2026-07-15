@@ -13,13 +13,14 @@ The current workflow is split into two stages:
 
 ```text
 CamLabel3D/
-├── camlabel3d/          # Desktop app, UI, tracking, CSV IO, processing
+├── camlabel3d/          # Layered desktop app, application services, core and IO
 ├── workers/             # Vendored WildDet3D code and related worker scripts
 ├── configs/             # Local dataset/source configuration
 ├── ckpts/               # Local model checkpoints (not committed)
 ├── docs/                # Setup and usage documentation
 ├── tests/               # Unit tests
-├── run_camlabel3d_ui.py
+├── pyproject.toml        # Package, test, and lint configuration
+├── ui.py                 # Convenience desktop launcher
 └── run_camlabel3d_postprocess.py
 ```
 
@@ -32,12 +33,27 @@ CamLabel3D/
 5. Launch the UI:
 
 ```powershell
-python .\run_camlabel3d_ui.py
+python -m camlabel3d
+```
+
+The repository-level convenience launcher is equivalent:
+
+```powershell
+python .\ui.py
+```
+
+The postprocessing CLI can be inspected with either entrypoint:
+
+```powershell
+python -m camlabel3d.postprocess_cli --help
+python .\run_camlabel3d_postprocess.py --help
 ```
 
 For a step-by-step Windows setup, see [docs/INSTALL_CAMLABEL3D.md](docs/INSTALL_CAMLABEL3D.md).
 
 For checkpoint download instructions, see [docs/CHECKPOINTS.md](docs/CHECKPOINTS.md).
+
+For module boundaries, concurrency rules, and runtime resource controls, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Configuration
 
@@ -52,3 +68,4 @@ The repository ignores the local `configs/dataset_sources.json` file because it 
 - WildDet3D is vendored under `workers/WildDet3D`.
 - CamLabel3D now resolves WildDet3D from `workers/WildDet3D` and checkpoints from the repository-level `ckpts/` directory by default.
 - Checkpoints, generated annotations, and local dataset paths are intentionally excluded from version control.
+- Runtime dependencies are installed explicitly as described in the Windows setup guide; the root package metadata intentionally does not duplicate the upstream WildDet3D dependency stack.

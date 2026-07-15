@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field, replace
+from time import monotonic
 from typing import Callable
 
 import numpy as np
@@ -62,8 +63,11 @@ class _TrackState:
         return self.observations[0].frame_index
 
     def add(self, observation: _Observation, locked: bool = False) -> None:
-        self.observations.append(observation)
-        self.observations.sort(key=lambda item: item.frame_index)
+        if not self.observations or observation.frame_index >= self.observations[-1].frame_index:
+            self.observations.append(observation)
+        else:
+            self.observations.append(observation)
+            self.observations.sort(key=lambda item: item.frame_index)
         self.has_locked = self.has_locked or bool(locked)
 
     def latest_observation(self) -> _Observation:
@@ -130,6 +134,7 @@ class TrackingEngine:
             for category in categories
         )
         progress_step = 0
+        last_progress_at = 0.0
 
         assignment_by_record: dict[int, str] = {}
         tracks_by_category: dict[str, list[_TrackState]] = {}
@@ -150,8 +155,12 @@ class TrackingEngine:
             track_by_id: dict[str, _TrackState] = {}
 
             for frame_index in frames:
-                if progress_callback:
+                if should_cancel and should_cancel():
+                    return updated_records
+                now = monotonic()
+                if progress_callback and (progress_step == 0 or now - last_progress_at >= 0.05):
                     progress_callback(progress_step, max(1, total_frames), f"Tracking {category} frame {frame_index}")
+                    last_progress_at = now
                 progress_step += 1
 
                 for locked_obs in sorted(
@@ -188,7 +197,10 @@ class TrackingEngine:
                     detections,
                     frame_index,
                     params,
+                    should_cancel=should_cancel,
                 )
+                if should_cancel and should_cancel():
+                    return updated_records
 
                 for track_idx, det_idx in matches:
                     track = candidate_tracks[track_idx]
@@ -212,7 +224,12 @@ class TrackingEngine:
                     track_by_id[track_id] = new_track
                     assignment_by_record[detection.record_index] = track_id
 
-            self._gap_close_tracks(tracks, assignment_by_record, params)
+            self._gap_close_tracks(
+                tracks,
+                assignment_by_record,
+                params,
+                should_cancel=should_cancel,
+            )
             tracks_by_category[category] = tracks
 
         for idx, record in enumerate(updated_records):
@@ -279,12 +296,15 @@ class TrackingEngine:
         detections: list[_Observation],
         frame_index: int,
         config: TrackingConfig,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> tuple[list[tuple[int, int]], list[int], list[int]]:
         if not tracks or not detections:
             return [], list(range(len(tracks))), list(range(len(detections)))
 
         cost_matrix = np.full((len(tracks), len(detections)), fill_value=np.inf, dtype=np.float64)
         for track_idx, track in enumerate(tracks):
+            if should_cancel and should_cancel():
+                return [], list(range(len(tracks))), list(range(len(detections)))
             for det_idx, detection in enumerate(detections):
                 cost = self._association_cost(track, detection, frame_index, config)
                 cost_matrix[track_idx, det_idx] = cost
@@ -367,6 +387,7 @@ class TrackingEngine:
         tracks: list[_TrackState],
         assignment_by_record: dict[int, str],
         config: TrackingConfig,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> None:
         if len(tracks) <= 1:
             return
@@ -375,6 +396,8 @@ class TrackingEngine:
         candidates: list[tuple[int, int]] = []
         costs: list[float] = []
         for source_idx, source in enumerate(ordered_tracks):
+            if should_cancel and should_cancel():
+                return
             for target_idx, target in enumerate(ordered_tracks):
                 if source_idx == target_idx:
                     continue

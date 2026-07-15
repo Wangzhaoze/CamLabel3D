@@ -12,12 +12,7 @@ from PySide6.QtWidgets import QWidget
 
 from camlabel3d.core.models import PointPrompt, PromptMode
 
-
-def _pil_to_qimage(image: Image.Image) -> QImage:
-    rgb = image.convert("RGB")
-    data = rgb.tobytes("raw", "RGB")
-    qimage = QImage(data, rgb.width, rgb.height, rgb.width * 3, QImage.Format.Format_RGB888)
-    return qimage.copy()
+from .image_utils import pil_to_qimage
 
 
 class FrameCanvas(QWidget):
@@ -53,7 +48,11 @@ class FrameCanvas(QWidget):
     def set_image(self, image: Image.Image | np.ndarray) -> None:
         if isinstance(image, np.ndarray):
             image = Image.fromarray(image.astype(np.uint8))
-        qimage = _pil_to_qimage(image)
+        self.set_qimage(pil_to_qimage(image))
+
+    def set_qimage(self, qimage: QImage) -> None:
+        """Install an already converted image with minimal GUI-thread work."""
+
         self._pixmap = QPixmap.fromImage(qimage)
         self._image_size = (qimage.width(), qimage.height())
         self.update()

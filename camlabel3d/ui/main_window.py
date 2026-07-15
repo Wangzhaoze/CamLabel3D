@@ -6,16 +6,17 @@ import os
 from datetime import date
 from enum import Enum
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 import numpy as np
-from PySide6.QtCore import QSignalBlocker, QSize, Qt, QUrl
+from PySide6.QtCore import QSignalBlocker, QSize, Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -37,24 +38,20 @@ from PySide6.QtWidgets import (
     QStyle,
 )
 
+from camlabel3d.application import ApplicationContext, LoadedSource, OutlierIndex, RecordIndex
 from camlabel3d.core import (
     BulkOperationRegistry,
-    DatasetConfigStore,
     DatasetSourcesConfig,
     DetectionConfig,
     DetectionRecord,
-    DetectorAdapter,
     FilterConfig,
     ImageFolderFrameProvider,
     OperationScope,
     OutlierHit,
     OutlierRuleRegistry,
-    OutlierScope,
     ParameterSpec,
     PointPrompt,
-    PostprocessSession,
     ProcessingContext,
-    ProcessingEngine,
     ProcessingScope,
     PromptMode,
     PromptSpec,
@@ -66,19 +63,31 @@ from camlabel3d.core import (
     VideoFrameProvider,
     WorkflowStage,
     apply_track_batch_edit,
-    build_default_bulk_operation_registry,
-    build_default_outlier_registry,
     clone_records,
 )
+from camlabel3d.io.csv_store import CSVStore
+from camlabel3d.runtime_config import RuntimeConfig
 
 from .bookmark_slider import BookmarkSlider
 from .canvas import FrameCanvas
 from .input_widgets import MenuWheelComboBox, NoWheelDoubleSpinBox, NoWheelSpinBox
 from .track_batch_dialog import TrackBatchEditorDialog
-from .worker import DetectionWorker, TrackingWorker
+from .workers import (
+    CSVSaveWorker,
+    DetectionWorker,
+    FunctionWorker,
+    OutlierAnalysisWorker,
+    PreviewRequest,
+    PreviewWorker,
+    SaveStatus,
+    SaveSubmission,
+    SourceLoadWorker,
+    TrackingWorker,
+)
 
 RESULTS_TABLE_COLUMNS: list[tuple[str, str, str, bool]] = [
-    ("Show", "is_enabled", "bool", True),
+    ("Show", "is_visible", "bool", True),
+    ("Enabled", "is_enabled", "bool", True),
     ("Category", "category", "str", True),
     ("Score", "score", "score", False),
     ("2D Score", "score_2d", "score", False),
@@ -119,9 +128,6 @@ OUTLIER_RULE_COLORS: dict[str, QColor] = {
     "size_spike": QColor(64, 156, 255),
     "center_spike": QColor(74, 201, 126),
 }
-AUTO_OUTLIER_REFRESH_RECORD_LIMIT = 12000
-
-
 class ActivitySection(str, Enum):
     FILE = "File"
     DETECT = "Detect"
@@ -131,20 +137,25 @@ class ActivitySection(str, Enum):
 class MainWindow(QMainWindow):
     """CamLabel3D desktop UI."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        runtime_config: RuntimeConfig | None = None,
+        application_context: ApplicationContext | None = None,
+    ) -> None:
         super().__init__()
         self.setWindowTitle("CamLabel3D - WildDet3D Detection Review")
         self.resize(1840, 1100)
 
-        self.detector = DetectorAdapter()
-        self.dataset_config_store = DatasetConfigStore()
-        self.postprocess_session = PostprocessSession()
-        self.outlier_registry: OutlierRuleRegistry = build_default_outlier_registry()
-        self.bulk_operation_registry: BulkOperationRegistry = build_default_bulk_operation_registry()
-        self.processing_engine = ProcessingEngine(
-            outlier_registry=self.outlier_registry,
-            bulk_operation_registry=self.bulk_operation_registry,
-        )
+        self.application_context = application_context or ApplicationContext.create(runtime_config)
+        self.runtime_config = self.application_context.runtime_config
+        self.detector = self.application_context.detector
+        self.dataset_config_store = self.application_context.dataset_config_store
+        self.postprocess_session = self.application_context.postprocess_session
+        self.outlier_registry: OutlierRuleRegistry = self.application_context.outlier_registry
+        self.bulk_operation_registry: BulkOperationRegistry = self.application_context.bulk_operation_registry
+        self.processing_engine = self.application_context.processing_engine
+        self.source_service = self.application_context.source_service
+        self.record_index = RecordIndex()
         self.dataset_config: DatasetSourcesConfig | None = None
 
         self.current_provider: ImageFolderFrameProvider | VideoFrameProvider | None = None
@@ -162,7 +173,8 @@ class MainWindow(QMainWindow):
         self.selected_dataset_id = ""
         self.selected_recording_id = ""
 
-        self.records: list[DetectionRecord] = []
+        self._records: list[DetectionRecord] = []
+        self.records = []
         self.current_frame_index = 0
         self.current_prompt_box: tuple[float, float, float, float] | None = None
         self.current_prompt_points: list[PointPrompt] = []
@@ -171,6 +183,11 @@ class MainWindow(QMainWindow):
 
         self.detection_worker: DetectionWorker | None = None
         self.tracking_worker: TrackingWorker | None = None
+        self.outlier_worker: OutlierAnalysisWorker | None = None
+        self.source_load_worker: SourceLoadWorker | None = None
+        self.io_task_worker: FunctionWorker | None = None
+        self._io_task_result_handler: Callable[[object], None] | None = None
+        self._io_task_failure_title = "Background Task Failed"
         self._controls_locked = False
         self._results_table_internal_change = False
         self._outlier_rule_table_internal_change = False
@@ -183,7 +200,8 @@ class MainWindow(QMainWindow):
         self.outlier_hits_by_track_id: dict[str, list[OutlierHit]] = {}
         self.outlier_hits_by_rule_id: dict[str, list[OutlierHit]] = {}
         self.outlier_frames: set[int] = set()
-        self.outlier_refresh_deferred = False
+        self.outlier_index = OutlierIndex()
+        self.outlier_analysis_state = "not_run"
         self.outlier_rule_enabled: dict[str, bool] = {
             rule.rule_id: bool(rule.default_enabled)
             for rule in self.outlier_registry.all()
@@ -205,7 +223,21 @@ class MainWindow(QMainWindow):
         self._side_panel_last_width = 420
         self._results_panel_last_height = 280
 
-        self.model_status_text = "Model idle (loads on detect)"
+        self._preview_request_seq = 0
+        self._latest_preview_request_seq = 0
+        self._last_displayed_preview_seq = -1
+        self._save_revision = 0
+        self._last_saved_revision_by_path: dict[str, int] = {}
+        self._outlier_generation = 0
+        self._pending_outlier_selection: tuple[str | None, str | None, bool] = (None, None, False)
+        self._retired_providers: list[ImageFolderFrameProvider | VideoFrameProvider] = []
+        self._retired_provider_close_scheduled = False
+        self._close_requested = False
+        self._close_final_save_queued = False
+        self._close_retry_scheduled = False
+        self._close_save_submission: SaveSubmission | None = None
+
+        self.model_status_text = self._idle_model_status()
 
         self._build_ui()
         self._connect_signals()
@@ -214,10 +246,36 @@ class MainWindow(QMainWindow):
         self._on_intrinsics_mode_changed()
         self._set_idle_progress()
 
+        self.preview_timer = QTimer(self)
+        self.preview_timer.setSingleShot(True)
+        self.preview_timer.timeout.connect(self._submit_preview_request)
+        self.preview_worker = PreviewWorker(self.detector, parent=self)
+        self.preview_worker.previewReady.connect(self._on_preview_ready)
+        self.preview_worker.previewFailed.connect(self._on_preview_failed)
+        self.preview_worker.start()
+
+        self.autosave_timer = QTimer(self)
+        self.autosave_timer.setSingleShot(True)
+        self.autosave_timer.timeout.connect(self._persist_active_records)
+        self.csv_save_worker = CSVSaveWorker(parent=self)
+        self.csv_save_worker.saveCompleted.connect(self._on_save_completed)
+        self.csv_save_worker.saveFailed.connect(self._on_save_failed)
+        self.csv_save_worker.start()
+
         self._load_dataset_config(initial=True)
         self._apply_source_mode_ui()
         self._refresh_info_panel()
         self._update_action_states()
+
+    @property
+    def records(self) -> list[DetectionRecord]:
+        return self._records
+
+    @records.setter
+    def records(self, value: Iterable[DetectionRecord]) -> None:
+        self._records = list(value)
+        if hasattr(self, "record_index"):
+            self.record_index.rebuild(self._records)
 
     def _build_ui(self) -> None:
         central = QWidget(self)
@@ -264,6 +322,9 @@ class MainWindow(QMainWindow):
         self.frame_slider = BookmarkSlider(Qt.Orientation.Horizontal)
         self.frame_slider.setMinimum(0)
         self.frame_slider.setMaximum(0)
+        # Keep valueChanged flowing while the handle is held. Preview rendering
+        # is separately throttled, so live scrubbing cannot flood the worker.
+        self.frame_slider.setTracking(True)
         self.frame_index_spin = NoWheelSpinBox()
         self.frame_index_spin.setMinimum(0)
         self.frame_index_spin.setMaximum(0)
@@ -281,7 +342,10 @@ class MainWindow(QMainWindow):
         self.outlier_group = self._build_outlier_group(self.side_panel_container)
         self.bulk_ops_group = self._build_bulk_ops_group(self.side_panel_container)
         self.track_group = self._build_track_group(self.side_panel_container)
-        self.info_group = self._build_info_group(self.side_panel_container)
+        self.info_label = QLabel(self)
+        self.info_label.hide()
+        self.info_label.setWordWrap(True)
+        self.info_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.results_group = self._build_results_group(central)
 
         self._populate_side_panel_pages()
@@ -347,12 +411,7 @@ class MainWindow(QMainWindow):
         widget = QWidget(parent)
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(8, 0, 8, 0)
-        layout.setSpacing(8)
-
-        self.side_panel_title_label = QLabel(widget)
-        self.side_panel_title_label.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
-        self.side_panel_title_label.setStyleSheet("font-weight: 600;")
-        layout.addWidget(self.side_panel_title_label)
+        layout.setSpacing(0)
 
         self.side_panel_stack = QStackedWidget(widget)
         layout.addWidget(self.side_panel_stack, stretch=1)
@@ -360,7 +419,7 @@ class MainWindow(QMainWindow):
 
     def _populate_side_panel_pages(self) -> None:
         pages = {
-            ActivitySection.FILE: [self.source_group, self.info_group],
+            ActivitySection.FILE: [self.source_group],
             ActivitySection.DETECT: [self.prompt_group, self.detection_params_group, self.run_group],
             ActivitySection.TRACK: [self.postprocess_group, self.outlier_group, self.bulk_ops_group, self.track_group],
         }
@@ -373,10 +432,12 @@ class MainWindow(QMainWindow):
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setObjectName(f"{title.lower()}PanelPage")
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
 
         content = QWidget(scroll)
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(0, 8, 0, 8)
         layout.setSpacing(8)
         for group in groups:
             layout.addWidget(group)
@@ -392,7 +453,6 @@ class MainWindow(QMainWindow):
         self.activity_section = section
         page_index = self._activity_page_indices.get(section, 0)
         self.side_panel_stack.setCurrentIndex(page_index)
-        self.side_panel_title_label.setText(section.value.upper())
         self._set_side_panel_visible(True)
         self._sync_activity_buttons()
 
@@ -448,8 +508,8 @@ class MainWindow(QMainWindow):
             desired_bottom = min(max(self._results_panel_last_height, 220), max(total_height - 140, 140))
             self.main_view_splitter.setSizes([max(total_height - desired_bottom, 140), desired_bottom])
 
-    def _build_source_group(self, parent: QWidget) -> QGroupBox:
-        group = QGroupBox("File", parent)
+    def _build_source_group(self, parent: QWidget) -> QWidget:
+        group = QWidget(parent)
         layout = QVBoxLayout(group)
         layout.setContentsMargins(8, 10, 8, 8)
         layout.setSpacing(8)
@@ -512,8 +572,8 @@ class MainWindow(QMainWindow):
         annotation_layout.setSpacing(8)
 
         self.annotation_csv_hint_label = QLabel(
-            "Load an existing annotation CSV for the current media source, or leave it empty to use the source-derived CSV. "
-            "If the source has not been annotated yet, a blank CSV will be created automatically.",
+            "This CSV path is the current active output target by default. "
+            "To open an existing annotation CSV instead, enter or browse to it here, then click Load CSV.",
             annotation_group,
         )
         self.annotation_csv_hint_label.setWordWrap(True)
@@ -521,20 +581,13 @@ class MainWindow(QMainWindow):
 
         annotation_form = QFormLayout()
         self.annotation_csv_path_edit = QLineEdit(annotation_group)
-        self.annotation_csv_path_edit.setPlaceholderText("Optional existing CSV path for this source")
-        annotation_form.addRow("Load From", self.annotation_csv_path_edit)
-
-        self.output_csv_edit = QLineEdit(annotation_group)
-        self.output_csv_edit.setReadOnly(True)
-        annotation_form.addRow("Active CSV", self.output_csv_edit)
+        self.annotation_csv_path_edit.setPlaceholderText("CSV path")
+        annotation_form.addRow("CSV", self.annotation_csv_path_edit)
         annotation_layout.addLayout(annotation_form)
 
         self.browse_annotation_csv_btn = QPushButton("Browse CSV", annotation_group)
         self.load_annotation_csv_btn = QPushButton("Load CSV", annotation_group)
-        self.use_source_csv_btn = QPushButton("Use Source CSV", annotation_group)
-        annotation_layout.addWidget(
-            self._row_widget(self.browse_annotation_csv_btn, self.load_annotation_csv_btn, self.use_source_csv_btn)
-        )
+        annotation_layout.addWidget(self._row_widget(self.browse_annotation_csv_btn, self.load_annotation_csv_btn))
 
         self.open_result_folder_btn = QPushButton("Open Result Folder", annotation_group)
         self.save_csv_btn = QPushButton("Save CSV Now", annotation_group)
@@ -700,6 +753,13 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._row_widget(self.refresh_outliers_btn, self.fix_selected_outlier_btn))
         layout.addWidget(self._row_widget(self.fix_scope_outliers_btn, self.fix_all_visible_outliers_btn))
 
+        self.outlier_hint_label = QLabel(
+            "Rules are off by default. Enable the rules you want, then click Refresh Outliers to run them.",
+            group,
+        )
+        self.outlier_hint_label.setWordWrap(True)
+        layout.addWidget(self.outlier_hint_label)
+
         self.outlier_table = QTableWidget(group)
         self.outlier_table.setColumnCount(len(OUTLIER_TABLE_COLUMNS))
         self.outlier_table.setHorizontalHeaderLabels(["Frame", "Track", "Category", "Rule", "Severity", "Fix", "Message"])
@@ -832,7 +892,6 @@ class MainWindow(QMainWindow):
         self.annotation_csv_path_edit.textChanged.connect(self._on_annotation_csv_path_changed)
         self.browse_annotation_csv_btn.clicked.connect(self._browse_annotation_csv)
         self.load_annotation_csv_btn.clicked.connect(self._load_selected_annotation_csv)
-        self.use_source_csv_btn.clicked.connect(self._use_source_csv)
         self.open_result_folder_btn.clicked.connect(self._open_result_folder)
         self.save_csv_btn.clicked.connect(self._save_csv_now)
 
@@ -846,6 +905,7 @@ class MainWindow(QMainWindow):
         self.prev_frame_btn.clicked.connect(lambda: self._step_frame(-1))
         self.next_frame_btn.clicked.connect(lambda: self._step_frame(1))
         self.frame_slider.valueChanged.connect(self._on_frame_slider_changed)
+        self.frame_slider.sliderReleased.connect(self._on_frame_slider_released)
         self.frame_index_spin.valueChanged.connect(self._on_frame_spin_changed)
 
         self.run_current_btn.clicked.connect(self._run_current_frame)
@@ -1109,113 +1169,151 @@ class MainWindow(QMainWindow):
         self._update_action_states()
 
     def _clear_outlier_state(self) -> None:
-        self.outlier_hits_global = []
+        self.outlier_index = OutlierIndex()
+        self.outlier_hits_global = self.outlier_index.hits
         self.outlier_hits_visible = []
-        self.outlier_hits_by_det_id = {}
-        self.outlier_hits_by_frame = {}
-        self.outlier_hits_by_track_id = {}
-        self.outlier_hits_by_rule_id = {}
-        self.outlier_frames = set()
+        self.outlier_hits_by_det_id = self.outlier_index.by_det_id
+        self.outlier_hits_by_frame = self.outlier_index.by_frame
+        self.outlier_hits_by_track_id = self.outlier_index.by_track_id
+        self.outlier_hits_by_rule_id = self.outlier_index.by_rule_id
+        self.outlier_frames = self.outlier_index.frames
         self.frame_slider.clear_bookmarks()
         self._refresh_outlier_rule_table()
         self._refresh_visible_outlier_table()
 
-    def _build_processing_context(self, require_reprojection: bool) -> ProcessingContext | None:
+    def _set_outlier_analysis_state(self, state: str) -> None:
+        self.outlier_analysis_state = state
+
+    def _invalidate_outlier_analysis(
+        self,
+        *,
+        preserve_state: bool = False,
+        state: str | None = None,
+        show_status: bool = False,
+        message: str | None = None,
+    ) -> None:
+        previous_state = self.outlier_analysis_state
+        self._clear_outlier_state()
+        if state is not None:
+            next_state = state
+        elif preserve_state:
+            next_state = previous_state
+        elif previous_state == "ready":
+            next_state = "stale"
+        else:
+            next_state = "not_run"
+        self._set_outlier_analysis_state(next_state)
+        self._refresh_table(preserve_det_id=self._selected_det_id())
+        self._update_action_states()
+        self._refresh_info_panel()
+        if show_status and message:
+            self.statusBar().showMessage(message, 5000)
+
+    def _build_processing_context(
+        self,
+        require_reprojection: bool,
+        records: list[DetectionRecord] | None = None,
+    ) -> ProcessingContext | None:
         reproject_callback = None
         if require_reprojection:
-            if self.current_provider is None:
+            provider = self.current_provider
+            if provider is None:
                 self._show_warning("No Source", "Load a media source first.")
                 return None
-            reproject_callback = self._reproject_record_for_processing
+            actual_intrinsics = None
+            if self.use_actual_k_checkbox.isChecked():
+                try:
+                    actual_intrinsics = self._current_detection_config().to_intrinsics_matrix()
+                except Exception:
+                    actual_intrinsics = None
+
+            def reproject_callback(record: DetectionRecord) -> None:
+                intrinsics = self._record_projection_intrinsics(record, actual_intrinsics)
+                (
+                    record.box2d_x1,
+                    record.box2d_y1,
+                    record.box2d_x2,
+                    record.box2d_y2,
+                ) = self.detector.project_record_to_box2d(
+                    record=record,
+                    intrinsics=intrinsics,
+                    image_shape=provider.frame_shape(record.frame_index),
+                )
+        target_records = self.records if records is None else records
         return ProcessingContext(
-            records=self.records,
+            records=target_records,
             current_frame_index=self.current_frame_index,
             selected_track_id=self._selected_track_id() or "",
-            track_summaries=self.postprocess_session.build_track_summaries(self.records),
+            track_summaries=self.postprocess_session.build_track_summaries(target_records),
             reproject_record=reproject_callback,
-        )
-
-    def _reproject_record_for_processing(self, record: DetectionRecord) -> None:
-        if self.current_provider is None:
-            raise ValueError("No active media source.")
-        intrinsics = self._intrinsics_for_record_projection(record)
-        (
-            record.box2d_x1,
-            record.box2d_y1,
-            record.box2d_x2,
-            record.box2d_y2,
-        ) = self.detector.project_record_to_box2d(
-            record=record,
-            intrinsics=intrinsics,
-            image_shape=self.current_provider.frame_shape(record.frame_index),
         )
 
     def _refresh_outlier_analysis_requested(self) -> None:
         self._refresh_outlier_analysis(show_status=True)
 
     def _refresh_outlier_analysis_after_heavy_update(self) -> str | None:
-        if len(self.records) <= AUTO_OUTLIER_REFRESH_RECORD_LIMIT:
-            self.outlier_refresh_deferred = False
-            self._refresh_outlier_analysis()
-            return None
-        self.outlier_refresh_deferred = True
-        self._clear_outlier_state()
-        message = (
-            f"Outlier refresh deferred for {len(self.records)} rows. "
-            "Use Refresh Outliers when needed."
-        )
-        self.statusBar().showMessage(message, 7000)
-        return message
+        self._invalidate_outlier_analysis()
+        return None
 
     def _refresh_outlier_analysis(self, show_status: bool = False) -> None:
         if show_status:
             self.statusBar().showMessage("Refreshing outliers...")
         if not self._is_postprocessing_stage() or self.current_provider is None:
-            self._clear_outlier_state()
-            self._refresh_table(preserve_det_id=self._selected_det_id())
-            self._update_action_states()
-            self._refresh_info_panel()
+            self._invalidate_outlier_analysis(state="not_run")
             if show_status:
                 self.statusBar().showMessage("Outlier refresh skipped: postprocessing is not active.", 5000)
             return
-        self.outlier_refresh_deferred = False
         enabled_rules = self._enabled_outlier_rule_ids()
         if not enabled_rules:
-            self._clear_outlier_state()
-            self._refresh_table(preserve_det_id=self._selected_det_id())
-            self._update_action_states()
-            self._refresh_info_panel()
+            self._invalidate_outlier_analysis(state="not_run", show_status=False)
             if show_status:
                 self.statusBar().showMessage("Outlier refresh complete: no rules are enabled.", 5000)
             return
-        context = self._build_processing_context(require_reprojection=False)
-        if context is None:
-            self._clear_outlier_state()
+        if self._is_background_task_running():
             if show_status:
-                self.statusBar().showMessage("Outlier refresh failed: processing context is unavailable.", 5000)
+                self.statusBar().showMessage("Another background task is already running.", 5000)
             return
+        snapshot = clone_records(self.records)
+        context = ProcessingContext(
+            records=snapshot,
+            current_frame_index=self.current_frame_index,
+            selected_track_id=self._selected_track_id() or "",
+        )
         preserve_rule_id = self._selected_outlier_rule_id()
         preserve_outlier_key = self._selected_outlier_key()
-        hits = self.processing_engine.analyze_outliers(
-            records=self.records,
-            scope=OutlierScope.GLOBAL,
+        self._outlier_generation += 1
+        self._pending_outlier_selection = (preserve_rule_id, preserve_outlier_key, show_status)
+        self.outlier_worker = OutlierAnalysisWorker(
+            engine=self.processing_engine,
+            context=context,
             enabled_rule_ids=enabled_rules,
             params_by_rule=self.outlier_rule_params,
-            context=context,
+            generation=self._outlier_generation,
+            parent=self,
         )
-        self.outlier_hits_global = hits
-        self.outlier_hits_by_det_id = {}
-        self.outlier_hits_by_frame = {}
-        self.outlier_hits_by_track_id = {}
-        self.outlier_hits_by_rule_id = {}
-        self.outlier_frames = set()
-        for hit in hits:
-            self.outlier_hits_by_det_id.setdefault(hit.det_id, []).append(hit)
-            self.outlier_hits_by_frame.setdefault(int(hit.frame_index), []).append(hit)
-            if str(hit.track_id).strip():
-                self.outlier_hits_by_track_id.setdefault(str(hit.track_id).strip(), []).append(hit)
-            self.outlier_hits_by_rule_id.setdefault(hit.rule_id, []).append(hit)
-            self.outlier_frames.add(int(hit.frame_index))
+        self.outlier_worker.analysisCompleted.connect(self._on_outlier_analysis_completed)
+        self.outlier_worker.analysisFailed.connect(self._on_outlier_analysis_failed)
+        self.outlier_worker.finished.connect(self._on_outlier_analysis_finished)
+        self._set_outlier_analysis_state("running")
+        self._set_running_state(True)
+        self.outlier_worker.start()
+
+    def _on_outlier_analysis_completed(self, payload: object) -> None:
+        if self._close_requested:
+            return
+        data = dict(payload)
+        if data.get("canceled") or int(data.get("generation", -1)) != self._outlier_generation:
+            self._set_outlier_analysis_state("stale")
+            return
+        hits = list(data.get("hits", []))
+        self.outlier_index = OutlierIndex.build(hits)
+        self.outlier_hits_global = self.outlier_index.hits
+        self.outlier_hits_by_det_id = self.outlier_index.by_det_id
+        self.outlier_hits_by_frame = self.outlier_index.by_frame
+        self.outlier_hits_by_track_id = self.outlier_index.by_track_id
+        self.outlier_hits_by_rule_id = self.outlier_index.by_rule_id
+        self.outlier_frames = self.outlier_index.frames
+        preserve_rule_id, preserve_outlier_key, show_status = self._pending_outlier_selection
         colored_bookmarks: dict[int, list[QColor]] = {}
         for hit in hits:
             color = self._outlier_rule_color(hit.rule_id)
@@ -1228,6 +1326,7 @@ class MainWindow(QMainWindow):
             self.frame_slider.set_colored_bookmarks(colored_bookmarks)
         else:
             self.frame_slider.clear_bookmarks()
+        self._set_outlier_analysis_state("ready")
         self._refresh_outlier_rule_table(preserve_rule_id=preserve_rule_id)
         self._load_selected_outlier_rule_editor()
         self._refresh_visible_outlier_table(preserve_key=preserve_outlier_key)
@@ -1239,6 +1338,20 @@ class MainWindow(QMainWindow):
                 f"Outlier refresh complete: {len(hits)} hits across {len(self.outlier_frames)} frame(s).",
                 6000,
             )
+
+    def _on_outlier_analysis_failed(self, error_message: str) -> None:
+        if self._close_requested:
+            return
+        self._set_outlier_analysis_state("stale")
+        self.statusBar().showMessage(f"Outlier refresh failed: {error_message}", 8000)
+
+    def _on_outlier_analysis_finished(self) -> None:
+        worker = self.outlier_worker
+        self.outlier_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        self._set_running_state(False)
+        self._refresh_info_panel()
 
     def _on_processing_scope_changed(self) -> None:
         self._update_action_states()
@@ -1254,7 +1367,10 @@ class MainWindow(QMainWindow):
         if not rule_id:
             return
         self.outlier_rule_enabled[str(rule_id)] = item.checkState() == Qt.CheckState.Checked
-        self._refresh_outlier_analysis()
+        self._invalidate_outlier_analysis(
+            show_status=True,
+            message="Outlier rule selection updated. Click Refresh Outliers to run the enabled rules.",
+        )
 
     def _on_bulk_operation_changed(self) -> None:
         self._load_selected_bulk_operation_editor()
@@ -1298,25 +1414,40 @@ class MainWindow(QMainWindow):
         if not hits:
             self.statusBar().showMessage(empty_message, 5000)
             return
-        context = self._build_processing_context(require_reprojection=True)
+        working_records = clone_records(self.records)
+        context = self._build_processing_context(require_reprojection=True, records=working_records)
         if context is None:
             return
-        before = clone_records(self.records)
-        result = self.processing_engine.fix_hits(
-            records=self.records,
-            hits=hits,
-            params_by_rule=self.outlier_rule_params,
-            context=context,
+        selected_hits = list(hits)
+
+        def fix_hits() -> object:
+            result = self.processing_engine.fix_hits(
+                records=working_records,
+                hits=selected_hits,
+                params_by_rule=self.outlier_rule_params,
+                context=context,
+            )
+            return working_records, result
+
+        def apply_fixes(payload: object) -> None:
+            updated_records, result = payload
+            if result.updated_count <= 0:
+                self.statusBar().showMessage(empty_message, 5000)
+                return
+            self.postprocess_session.push_undo_snapshot(self.records)
+            self.records = updated_records
+            self._persist_active_records()
+            self._refresh_current_frame_view()
+            self._refresh_track_table(preserve_track_id=self._selected_track_id())
+            self._invalidate_outlier_analysis()
+            self.statusBar().showMessage(result.message, 6000)
+
+        self._start_io_task(
+            fix_hits,
+            apply_fixes,
+            label="Fixing outliers...",
+            failure_title="Outlier Fix Failed",
         )
-        if result.updated_count <= 0:
-            self.statusBar().showMessage(empty_message, 5000)
-            return
-        self.postprocess_session.push_undo_snapshot(before)
-        self._persist_active_records()
-        self._refresh_current_frame_view()
-        self._refresh_track_table(preserve_track_id=self._selected_track_id())
-        self._refresh_outlier_analysis()
-        self.statusBar().showMessage(result.message, 6000)
 
     def _apply_selected_bulk_operation(self) -> None:
         operation_id = self._selected_bulk_operation_id()
@@ -1326,26 +1457,42 @@ class MainWindow(QMainWindow):
         if not self._is_postprocessing_stage():
             self._show_warning("Postprocessing Required", "Bulk operations are only available in postprocessing.")
             return
-        context = self._build_processing_context(require_reprojection=True)
+        working_records = clone_records(self.records)
+        context = self._build_processing_context(require_reprojection=True, records=working_records)
         if context is None:
             return
-        before = clone_records(self.records)
-        result = self.processing_engine.apply_operation(
-            operation_id=operation_id,
-            records=self.records,
-            scope=OperationScope(self._selected_processing_scope()),
-            params=self.bulk_operation_params.get(operation_id),
-            context=context,
+        operation_scope = OperationScope(self._selected_processing_scope())
+        params = dict(self.bulk_operation_params.get(operation_id) or {})
+
+        def apply_operation() -> object:
+            result = self.processing_engine.apply_operation(
+                operation_id=operation_id,
+                records=working_records,
+                scope=operation_scope,
+                params=params,
+                context=context,
+            )
+            return working_records, result
+
+        def apply_result(payload: object) -> None:
+            updated_records, result = payload
+            if result.updated_count <= 0:
+                self.statusBar().showMessage("The selected bulk operation made no changes.", 5000)
+                return
+            self.postprocess_session.push_undo_snapshot(self.records)
+            self.records = updated_records
+            self._persist_active_records()
+            self._refresh_current_frame_view()
+            self._refresh_track_table(preserve_track_id=self._selected_track_id())
+            self._invalidate_outlier_analysis()
+            self.statusBar().showMessage(result.message, 6000)
+
+        self._start_io_task(
+            apply_operation,
+            apply_result,
+            label="Applying bulk operation...",
+            failure_title="Bulk Operation Failed",
         )
-        if result.updated_count <= 0:
-            self.statusBar().showMessage("The selected bulk operation made no changes.", 5000)
-            return
-        self.postprocess_session.push_undo_snapshot(before)
-        self._persist_active_records()
-        self._refresh_current_frame_view()
-        self._refresh_track_table(preserve_track_id=self._selected_track_id())
-        self._refresh_outlier_analysis()
-        self.statusBar().showMessage(result.message, 6000)
 
     def _outlier_flags_for_record(self, record: DetectionRecord) -> str:
         hits = self.outlier_hits_by_det_id.get(record.det_id, [])
@@ -1523,43 +1670,13 @@ class MainWindow(QMainWindow):
         if not config or not dataset_id or not recording_id:
             return
 
-        dataset = config.get_dataset(dataset_id)
-        if dataset is None:
-            self._show_warning("Dataset Error", f"Unknown dataset: {dataset_id}")
-            return
-
-        try:
-            media_path = self.dataset_config_store.resolve_media_path(config, dataset_id, recording_id)
-            provider = ImageFolderFrameProvider(media_path)
-            output_path = self.dataset_config_store.seed_output_session_files(
-                config=config,
-                source_mode=SourceMode.DATASET,
-                dataset_id=dataset_id,
-                recording_id=recording_id,
-                on_date=date.today(),
+        self._start_source_load(
+            lambda should_cancel: self.source_service.load_dataset(
+                config,
+                dataset_id,
+                recording_id,
+                should_cancel=should_cancel,
             )
-        except Exception as exc:
-            self._show_warning("Source Load Failed", str(exc))
-            return
-
-        self.selected_dataset_id = dataset_id
-        self.selected_recording_id = recording_id
-        self.use_actual_k_checkbox.setChecked(True)
-        self.fx_spin.setValue(dataset.default_intrinsics.fx)
-        self.fy_spin.setValue(dataset.default_intrinsics.fy)
-        self.cx_spin.setValue(dataset.default_intrinsics.cx)
-        self.cy_spin.setValue(dataset.default_intrinsics.cy)
-
-        self._activate_provider(
-            provider=provider,
-            source_context=SourceContext(
-                source_mode=SourceMode.DATASET,
-                source_type="dataset_image_folder",
-                dataset_id=dataset_id,
-                recording_id=recording_id,
-            ),
-            output_path=output_path,
-            active_source_path=media_path,
         )
 
     def _choose_video(self) -> None:
@@ -1590,40 +1707,160 @@ class MainWindow(QMainWindow):
     def _load_manual_source(self, path: str | Path, mode: SourceMode) -> None:
         config = self.dataset_config
         source_path = Path(path).resolve()
-        try:
-            if mode == SourceMode.VIDEO:
-                provider = VideoFrameProvider(source_path)
-            elif mode == SourceMode.IMAGE_FOLDER:
-                provider = ImageFolderFrameProvider(source_path)
-            else:
-                raise ValueError(f"Unsupported manual source mode: {mode}")
-            if config is None:
-                raise ValueError("Dataset config is not loaded.")
-            output_path = self.dataset_config_store.seed_output_session_files(
-                config=config,
-                source_mode=mode,
-                manual_source_path=source_path,
-                on_date=date.today(),
-            )
-        except Exception as exc:
-            self._show_warning("Source Load Failed", str(exc))
+        if config is None:
+            self._show_warning("Source Load Failed", "Dataset config is not loaded.")
             return
 
-        self.manual_source_path = source_path
-        self.manual_path_edit.setText(str(source_path))
-        self._activate_provider(
-            provider=provider,
-            source_context=SourceContext(source_mode=mode, source_type=provider.source_type),
-            output_path=output_path,
-            active_source_path=source_path,
+        self._start_source_load(
+            lambda should_cancel: self.source_service.load_manual(
+                config,
+                source_path,
+                mode,
+                should_cancel=should_cancel,
+            )
         )
 
-    @staticmethod
-    def _ensure_blank_csv_exists(path: Path) -> None:
-        resolved = Path(path).resolve()
-        if resolved.exists():
+    def _start_source_load(self, loader: Callable[[Callable[[], bool]], object]) -> None:
+        if self._is_background_task_running():
+            self._show_warning("Run in Progress", "Another background task is already active.")
             return
-        CSVStore(resolved, backup_enabled=False).save_records([])
+        self.source_load_worker = SourceLoadWorker(loader, parent=self)
+        self.source_load_worker.sourceLoaded.connect(self._on_source_loaded)
+        self.source_load_worker.sourceFailed.connect(self._on_source_load_failed)
+        self.source_load_worker.finished.connect(self._on_source_load_finished)
+        self._set_running_state(True)
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setFormat("Loading source...")
+        self.statusBar().showMessage("Opening media source in background...")
+        self.source_load_worker.start()
+
+    def _on_source_loaded(self, payload: object) -> None:
+        loaded = payload
+        if not isinstance(loaded, LoadedSource):
+            self._show_warning("Source Load Failed", "Source worker returned an invalid result.")
+            return
+        provider = loaded.provider
+        if self._close_requested:
+            provider.close()
+            return
+        try:
+            self._activate_provider(
+                provider=provider,
+                source_context=loaded.source_context,
+                output_path=loaded.output_path,
+                active_source_path=loaded.active_source_path,
+            )
+            # Commit source-specific UI metadata only after the provider and
+            # prepared session have been activated successfully.
+            intrinsics = loaded.intrinsics
+            if intrinsics is not None:
+                self.selected_dataset_id = loaded.dataset_id
+                self.selected_recording_id = loaded.recording_id
+                self.use_actual_k_checkbox.setChecked(True)
+                self.fx_spin.setValue(intrinsics.fx)
+                self.fy_spin.setValue(intrinsics.fy)
+                self.cx_spin.setValue(intrinsics.cx)
+                self.cy_spin.setValue(intrinsics.cy)
+            manual_source_path = loaded.manual_source_path
+            if manual_source_path is not None:
+                self.manual_source_path = Path(manual_source_path).resolve()
+                self.manual_path_edit.setText(str(self.manual_source_path))
+        except Exception as exc:
+            provider.close()
+            self._show_warning("Source Load Failed", str(exc))
+
+    def _on_source_load_failed(self, error_message: str) -> None:
+        if not self._close_requested:
+            self._show_warning("Source Load Failed", error_message)
+
+    def _on_source_load_finished(self) -> None:
+        worker = self.source_load_worker
+        self.source_load_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        self._set_running_state(False)
+        self._set_idle_progress()
+
+    def _start_io_task(
+        self,
+        function: Callable[[], object],
+        result_handler: Callable[[object], None],
+        *,
+        label: str,
+        failure_title: str,
+    ) -> None:
+        if self._is_background_task_running():
+            self._show_warning("Run in Progress", "Another background task is already active.")
+            return
+        self._io_task_result_handler = result_handler
+        self._io_task_failure_title = failure_title
+        self.io_task_worker = FunctionWorker(function, parent=self)
+        self.io_task_worker.resultReady.connect(self._on_io_task_ready)
+        self.io_task_worker.taskFailed.connect(self._on_io_task_failed)
+        self.io_task_worker.finished.connect(self._on_io_task_finished)
+        self._set_running_state(True)
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setFormat(label)
+        self.statusBar().showMessage(label)
+        self.io_task_worker.start()
+
+    def _on_io_task_ready(self, result: object) -> None:
+        if self._close_requested:
+            return
+        handler = self._io_task_result_handler
+        if handler is not None:
+            try:
+                handler(result)
+            except Exception as exc:
+                self._show_warning(self._io_task_failure_title, str(exc))
+
+    def _on_io_task_failed(self, error_message: str) -> None:
+        if not self._close_requested:
+            self._show_warning(self._io_task_failure_title, error_message)
+
+    def _on_io_task_finished(self) -> None:
+        worker = self.io_task_worker
+        self.io_task_worker = None
+        self._io_task_result_handler = None
+        if worker is not None:
+            worker.deleteLater()
+        self._set_running_state(False)
+        self._set_idle_progress()
+
+    def _prepare_source_session(
+        self,
+        output_path: Path,
+        active_source_path: Path,
+        *,
+        reset_frame_index: bool = False,
+    ) -> None:
+        if self.autosave_timer.isActive():
+            self.autosave_timer.stop()
+            self._persist_active_records()
+        resolved_output_path = Path(output_path).resolve()
+        resolved_source_path = Path(active_source_path).resolve()
+        stage, active_csv_path = self.postprocess_session.configure_source(resolved_output_path)
+        self.current_source_output_csv_path = resolved_output_path
+        self.current_annotation_csv_override_path = None
+        self.current_raw_csv_path = self.postprocess_session.raw_path
+        self.current_latest_csv_path = self.postprocess_session.latest_path
+        self.current_output_csv_path = active_csv_path.resolve()
+        self.current_result_dir = self.current_output_csv_path.parent
+        self.current_active_source_path = resolved_source_path
+        self.active_source_path_edit.setText(str(resolved_source_path))
+
+        self.stage_label.setText(f"Stage: {stage.value}")
+        self.records = []
+        if reset_frame_index:
+            self.current_frame_index = 0
+        self._sync_frame_controls()
+        self._load_csv_side_inputs()
+        self._refresh_output_path_display()
+        self._invalidate_outlier_analysis(state="not_run")
+        self._refresh_current_frame_view()
+        self._refresh_track_table()
+        self._refresh_info_panel()
+        self._update_action_states()
 
     def _activate_csv_session(
         self,
@@ -1631,19 +1868,27 @@ class MainWindow(QMainWindow):
         active_source_path: Path,
         *,
         selected_csv_path: Path | None = None,
-        ensure_blank_source_csv: bool = False,
+        loaded_records: list[DetectionRecord] | None = None,
         reset_frame_index: bool = False,
     ) -> None:
+        if self.autosave_timer.isActive():
+            self.autosave_timer.stop()
+            self._persist_active_records()
         resolved_output_path = Path(output_path).resolve()
         resolved_source_path = Path(active_source_path).resolve()
         resolved_selected_csv = Path(selected_csv_path).resolve() if selected_csv_path is not None else None
-        if ensure_blank_source_csv and resolved_selected_csv is None:
-            self._ensure_blank_csv_exists(resolved_output_path)
 
-        stage, active_csv_path, records = self.postprocess_session.activate(
-            resolved_output_path,
-            selected_csv_path=resolved_selected_csv,
-        )
+        if loaded_records is None:
+            stage, active_csv_path, records = self.postprocess_session.activate(
+                resolved_output_path,
+                selected_csv_path=resolved_selected_csv,
+            )
+        else:
+            stage, active_csv_path = self.postprocess_session.configure_activation(
+                resolved_output_path,
+                selected_csv_path=resolved_selected_csv,
+            )
+            records = list(loaded_records)
         self.current_source_output_csv_path = resolved_output_path
         self.current_annotation_csv_override_path = resolved_selected_csv
         self.current_raw_csv_path = self.postprocess_session.raw_path
@@ -1660,7 +1905,7 @@ class MainWindow(QMainWindow):
         self._sync_frame_controls()
         self._load_csv_side_inputs()
         self._refresh_output_path_display()
-        self._refresh_outlier_analysis()
+        self._invalidate_outlier_analysis(state="not_run")
         self._expand_results_panel_if_needed(force=bool(self.records))
         self._refresh_current_frame_view()
         self._refresh_track_table()
@@ -1671,10 +1916,7 @@ class MainWindow(QMainWindow):
         if self._is_background_task_running():
             self._show_warning("Run in Progress", "Cancel the active run before loading another CSV.")
             return
-        initial_path = self.annotation_csv_path_edit.text().strip()
-        if initial_path:
-            start_dir = str(Path(initial_path).resolve().parent)
-        elif self.current_result_dir is not None:
+        if self.current_result_dir is not None:
             start_dir = str(self.current_result_dir)
         else:
             start_dir = str(Path.home())
@@ -1705,41 +1947,33 @@ class MainWindow(QMainWindow):
         if not selected_csv_path.exists() or not selected_csv_path.is_file():
             self._show_warning("CSV Not Found", f"Annotation CSV not found:\n{selected_csv_path}")
             return
-        try:
-            self._activate_csv_session(
-                self.current_source_output_csv_path,
-                self.current_active_source_path,
-                selected_csv_path=selected_csv_path,
-                ensure_blank_source_csv=False,
-                reset_frame_index=False,
-            )
-        except Exception as exc:
-            self._show_warning("CSV Load Failed", str(exc))
-            return
-        self.statusBar().showMessage(f"Loaded annotation CSV: {selected_csv_path}", 5000)
 
-    def _use_source_csv(self) -> None:
-        if self._is_background_task_running():
-            self._show_warning("Run in Progress", "Cancel the active run before switching CSV.")
-            return
-        if self.current_provider is None or self.current_active_source_path is None:
-            self._show_warning("No Source", "Load a dataset, video, or image folder first.")
-            return
-        if self.current_source_output_csv_path is None:
-            self._show_warning("No Default CSV", "The current source does not have a resolved CSV path yet.")
-            return
-        try:
+        output_path = self.current_source_output_csv_path
+        active_source_path = self.current_active_source_path
+        if self.autosave_timer.isActive():
+            self.autosave_timer.stop()
+        save_submission = self._persist_active_records()
+
+        def load_records() -> object:
+            self._require_save_success(save_submission, context="current annotation CSV")
+            return CSVStore(selected_csv_path).load_records()
+
+        def activate_loaded(result: object) -> None:
             self._activate_csv_session(
-                self.current_source_output_csv_path,
-                self.current_active_source_path,
-                selected_csv_path=None,
-                ensure_blank_source_csv=True,
+                output_path,
+                active_source_path,
+                selected_csv_path=selected_csv_path,
+                loaded_records=list(result),
                 reset_frame_index=False,
             )
-        except Exception as exc:
-            self._show_warning("CSV Load Failed", str(exc))
-            return
-        self.statusBar().showMessage("Switched to the source-derived annotation CSV.", 5000)
+            self.statusBar().showMessage(f"Loaded annotation CSV: {selected_csv_path}", 5000)
+
+        self._start_io_task(
+            load_records,
+            activate_loaded,
+            label="Loading annotation CSV...",
+            failure_title="CSV Load Failed",
+        )
 
     def _activate_provider(
         self,
@@ -1748,14 +1982,16 @@ class MainWindow(QMainWindow):
         output_path: Path,
         active_source_path: Path,
     ) -> None:
+        # SourceService has already created the session CSV in its background
+        # transaction. No fallible disk I/O remains after retiring the current
+        # provider.
+        resolved_output_path = Path(output_path).resolve()
         self._close_provider()
         self.current_provider = provider
         self.current_source_context = source_context
-        self._activate_csv_session(
-            output_path,
+        self._prepare_source_session(
+            resolved_output_path,
             active_source_path,
-            selected_csv_path=None,
-            ensure_blank_source_csv=True,
             reset_frame_index=True,
         )
 
@@ -1776,7 +2012,6 @@ class MainWindow(QMainWindow):
         self.current_annotation_csv_override_path = None
         self.active_source_path_edit.clear()
         self.annotation_csv_path_edit.clear()
-        self.output_csv_edit.clear()
         if self.track_batch_dialog is not None:
             self.track_batch_dialog.hide()
         if clear_manual_path:
@@ -1786,6 +2021,7 @@ class MainWindow(QMainWindow):
         self.stage_label.setText(f"Stage: {WorkflowStage.DETECTION.value}")
         self._sync_frame_controls()
         self._clear_outlier_state()
+        self._set_outlier_analysis_state("not_run")
         self._refresh_table()
         self._refresh_track_table()
         self._refresh_frame_labels()
@@ -1793,11 +2029,47 @@ class MainWindow(QMainWindow):
         self._update_action_states()
 
     def _close_provider(self) -> None:
-        if self.current_provider is not None:
+        provider = self.current_provider
+        if provider is None:
+            return
+        if self.autosave_timer.isActive():
+            self.autosave_timer.stop()
+            self._persist_active_records()
+        self._invalidate_preview_requests()
+        self.preview_timer.stop()
+        self.preview_worker.discard_pending()
+        if self.preview_worker.wait_until_idle(timeout_ms=0):
             try:
-                self.current_provider.close()
+                provider.close()
             except Exception:
                 pass
+            return
+        # Never block the event loop waiting for decode/render. The stale
+        # provider is released after the worker publishes or discards its job.
+        if provider not in self._retired_providers:
+            self._retired_providers.append(provider)
+
+    def _close_retired_providers(self) -> None:
+        self._retired_provider_close_scheduled = False
+        if not self._retired_providers:
+            return
+        if not self.preview_worker.wait_until_idle(timeout_ms=0):
+            self._schedule_retired_provider_close()
+            return
+        retired, self._retired_providers = self._retired_providers, []
+        for provider in retired:
+            try:
+                provider.close()
+            except Exception:
+                pass
+
+    def _schedule_retired_provider_close(self) -> None:
+        """Keep at most one provider-cleanup timer in the Qt event queue."""
+
+        if self._retired_provider_close_scheduled:
+            return
+        self._retired_provider_close_scheduled = True
+        QTimer.singleShot(25, self._close_retired_providers)
 
     def _sync_frame_controls(self) -> None:
         frame_count = self.current_provider.frame_count if self.current_provider else 0
@@ -1847,8 +2119,23 @@ class MainWindow(QMainWindow):
     def _is_tracking_running(self) -> bool:
         return bool(self.tracking_worker and self.tracking_worker.isRunning())
 
+    def _is_outlier_running(self) -> bool:
+        return bool(self.outlier_worker and self.outlier_worker.isRunning())
+
+    def _is_source_loading(self) -> bool:
+        return bool(self.source_load_worker and self.source_load_worker.isRunning())
+
+    def _is_io_task_running(self) -> bool:
+        return bool(self.io_task_worker and self.io_task_worker.isRunning())
+
     def _is_background_task_running(self) -> bool:
-        return self._is_detection_running() or self._is_tracking_running()
+        return (
+            self._is_detection_running()
+            or self._is_tracking_running()
+            or self._is_outlier_running()
+            or self._is_source_loading()
+            or self._is_io_task_running()
+        )
 
     def _refresh_track_table(self, preserve_track_id: str | None = None) -> None:
         summaries = self.postprocess_session.build_track_summaries(self.records)
@@ -2012,7 +2299,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("The requested batch edit made no changes.", 5000)
             return result.message
 
-        self.postprocess_session.push_undo_snapshot(before)
+        self.postprocess_session.push_undo_snapshot(before, snapshot_owned=True)
         self._persist_active_records()
         deferred_message = self._refresh_outlier_analysis_after_heavy_update()
         self._refresh_current_frame_view()
@@ -2062,7 +2349,7 @@ class MainWindow(QMainWindow):
             self._refresh_track_batch_editor(selected_track_id=selected_track_id)
             return "No local table edits to apply."
 
-        self.postprocess_session.push_undo_snapshot(before)
+        self.postprocess_session.push_undo_snapshot(before, snapshot_owned=True)
         self._autosave()
         deferred_message = self._refresh_outlier_analysis_after_heavy_update()
         self._suspend_track_batch_dialog_sync = True
@@ -2095,21 +2382,36 @@ class MainWindow(QMainWindow):
         if not self.postprocess_session.can_start_postprocessing(self.records):
             self._show_warning("Raw Missing", "Run detection first so the raw detection CSV exists.")
             return
-        try:
-            active_path, records = self.postprocess_session.start_postprocessing(self.records)
-        except Exception as exc:
-            self._show_warning("Start Postprocessing Failed", str(exc))
-            return
+        if self.autosave_timer.isActive():
+            self.autosave_timer.stop()
+        save_submission = self._persist_active_records()
+        raw_path, latest_path = self.postprocess_session.postprocessing_paths()
 
-        self.current_latest_csv_path = self.postprocess_session.latest_path
-        self.current_output_csv_path = active_path
-        self.records = records
-        self.stage_label.setText(f"Stage: {self._current_stage().value}")
-        self._refresh_output_path_display()
-        self._refresh_outlier_analysis()
-        self._refresh_current_frame_view()
-        self._refresh_track_table()
-        self.statusBar().showMessage("Postprocessing started.", 5000)
+        def start_postprocessing() -> object:
+            self._require_save_success(save_submission, context="raw detection CSV")
+            records = CSVStore(raw_path).load_records()
+            CSVStore(latest_path, backup_enabled=False).save_records(records)
+            return latest_path, records
+
+        def activate_postprocessing(result: object) -> None:
+            active_path, records = result
+            committed_path = self.postprocess_session.commit_postprocessing(clear_undo=True)
+            self.current_latest_csv_path = committed_path
+            self.current_output_csv_path = active_path
+            self.records = records
+            self.stage_label.setText(f"Stage: {self._current_stage().value}")
+            self._refresh_output_path_display()
+            self._invalidate_outlier_analysis(state="not_run")
+            self._refresh_current_frame_view()
+            self._refresh_track_table()
+            self.statusBar().showMessage("Postprocessing started.", 5000)
+
+        self._start_io_task(
+            start_postprocessing,
+            activate_postprocessing,
+            label="Starting postprocessing...",
+            failure_title="Start Postprocessing Failed",
+        )
 
     def _apply_filter(self) -> None:
         if not self._is_postprocessing_stage():
@@ -2124,9 +2426,9 @@ class MainWindow(QMainWindow):
         if disabled <= 0:
             self.statusBar().showMessage("No detections matched the filter.", 5000)
             return
-        self.postprocess_session.push_undo_snapshot(before)
+        self.postprocess_session.push_undo_snapshot(before, snapshot_owned=True)
         self._persist_active_records()
-        self._refresh_outlier_analysis()
+        self._invalidate_outlier_analysis()
         self._refresh_current_frame_view()
         self._refresh_track_table()
         self.statusBar().showMessage(f"Disabled {disabled} detections.", 5000)
@@ -2142,6 +2444,7 @@ class MainWindow(QMainWindow):
         self.tracking_worker.progressChanged.connect(self._on_run_progress)
         self.tracking_worker.runCompleted.connect(self._on_tracking_completed)
         self.tracking_worker.runFailed.connect(self._on_tracking_failed)
+        self.tracking_worker.finished.connect(self._on_tracking_finished)
 
         self._set_running_state(True)
         self._set_idle_progress("Tracking...")
@@ -2149,13 +2452,12 @@ class MainWindow(QMainWindow):
         self.tracking_worker.start()
 
     def _on_tracking_completed(self, payload: object) -> None:
+        # Results are snapshots owned by the worker.  Once closing starts the
+        # final snapshot is captured only after workers finish, so a late queued
+        # signal must not mutate the stable state selected for shutdown.
+        if self._close_requested:
+            return
         data = dict(payload)
-        worker = self.tracking_worker
-        self.tracking_worker = None
-        if worker is not None:
-            worker.deleteLater()
-        self._set_running_state(False)
-
         if data.get("canceled"):
             self.statusBar().showMessage("Tracking canceled.", 5000)
             self._set_idle_progress("Canceled")
@@ -2166,7 +2468,7 @@ class MainWindow(QMainWindow):
         self.postprocess_session.push_undo_snapshot(self.records)
         self.records = updated_records
         self._persist_active_records()
-        self._refresh_outlier_analysis()
+        self._invalidate_outlier_analysis()
         self._refresh_table(preserve_det_id=self._selected_det_id())
         self._refresh_preview()
         self._refresh_track_table(preserve_track_id=self._selected_track_id())
@@ -2175,14 +2477,18 @@ class MainWindow(QMainWindow):
         self._refresh_info_panel()
 
     def _on_tracking_failed(self, error_message: str) -> None:
+        if self._close_requested:
+            return
+        self._set_idle_progress("Failed")
+        self._show_warning("Tracking Failed", error_message)
+        self._refresh_info_panel()
+
+    def _on_tracking_finished(self) -> None:
         worker = self.tracking_worker
         self.tracking_worker = None
         if worker is not None:
             worker.deleteLater()
         self._set_running_state(False)
-        self._set_idle_progress("Failed")
-        self._show_warning("Tracking Failed", error_message)
-        self._refresh_info_panel()
 
     def _undo_last_change(self) -> None:
         if not self._is_postprocessing_stage():
@@ -2194,7 +2500,7 @@ class MainWindow(QMainWindow):
             self._show_warning("Undo Failed", str(exc))
             return
         self._persist_active_records()
-        self._refresh_outlier_analysis()
+        self._invalidate_outlier_analysis()
         self._refresh_current_frame_view()
         self._refresh_track_table()
         self.statusBar().showMessage("Reverted the last change.", 5000)
@@ -2204,26 +2510,42 @@ class MainWindow(QMainWindow):
             self._show_warning("Postprocessing Required", "Latest is only available in postprocessing.")
             return
         self._persist_active_records()
-        self.statusBar().showMessage("Latest CSV saved.", 4000)
+        self.statusBar().showMessage("Latest CSV save queued.", 4000)
 
     def _reset_to_raw(self) -> None:
         if not self._is_postprocessing_stage():
             self._show_warning("Postprocessing Required", "Start postprocessing before resetting to raw.")
             return
         before = clone_records(self.records)
-        try:
-            active_path, records = self.postprocess_session.reset_to_raw()
-        except Exception as exc:
-            self._show_warning("Reset Failed", str(exc))
-            return
-        self.postprocess_session.push_undo_snapshot(before)
-        self.current_output_csv_path = active_path
-        self.records = records
-        self._persist_active_records()
-        self._refresh_outlier_analysis()
-        self._refresh_current_frame_view()
-        self._refresh_track_table()
-        self.statusBar().showMessage("Latest restored from raw detection.", 5000)
+        raw_path, latest_path = self.postprocess_session.postprocessing_paths()
+        if self.autosave_timer.isActive():
+            self.autosave_timer.stop()
+        save_submission = self._persist_active_records()
+
+        def reset_to_raw() -> object:
+            self._require_save_success(save_submission, context="latest annotation CSV")
+            records = CSVStore(raw_path).load_records()
+            CSVStore(latest_path, backup_enabled=False).save_records(records)
+            return latest_path, records
+
+        def apply_reset(result: object) -> None:
+            active_path, records = result
+            self.postprocess_session.commit_postprocessing(clear_undo=False)
+            self.postprocess_session.push_undo_snapshot(before, snapshot_owned=True)
+            self.current_output_csv_path = active_path
+            self.records = records
+            self._persist_active_records()
+            self._invalidate_outlier_analysis(state="not_run")
+            self._refresh_current_frame_view()
+            self._refresh_track_table()
+            self.statusBar().showMessage("Latest restored from raw detection.", 5000)
+
+        self._start_io_task(
+            reset_to_raw,
+            apply_reset,
+            label="Restoring raw detections...",
+            failure_title="Reset Failed",
+        )
 
     def _delete_selected_track(self) -> None:
         self._mutate_selected_track(
@@ -2258,9 +2580,9 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._show_warning("Merge Failed", str(exc))
             return
-        self.postprocess_session.push_undo_snapshot(before)
+        self.postprocess_session.push_undo_snapshot(before, snapshot_owned=True)
         self._persist_active_records()
-        self._refresh_outlier_analysis()
+        self._invalidate_outlier_analysis()
         self._refresh_current_frame_view()
         self._refresh_track_table(preserve_track_id=target_track_id)
         self.statusBar().showMessage(
@@ -2286,53 +2608,216 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._show_warning("Track Update Failed", str(exc))
             return
-        self.postprocess_session.push_undo_snapshot(before)
+        self.postprocess_session.push_undo_snapshot(before, snapshot_owned=True)
         self._persist_active_records()
-        self._refresh_outlier_analysis()
+        self._invalidate_outlier_analysis()
         self._refresh_current_frame_view()
         self._refresh_track_table(preserve_track_id=track_id)
         self.statusBar().showMessage(success_format.format(count=count, track_id=track_id), 5000)
 
-    def _persist_active_records(self) -> None:
-        path = self.postprocess_session.save_records(self.records)
+    def _persist_active_records(self) -> SaveSubmission | None:
+        try:
+            path, backup_enabled = self.postprocess_session.save_target()
+        except ValueError:
+            return None
+        self.record_index.rebuild(self.records)
+        self._save_revision += 1
+        revision = self._save_revision
+        submission = self.csv_save_worker.submit(
+            path=path,
+            records=clone_records(self.records),
+            revision=revision,
+            backup_enabled=backup_enabled,
+        )
+        if not submission.accepted:
+            self.statusBar().showMessage(
+                f"CSV save rejected ({submission.status.value}): {submission.detail}",
+                12000,
+            )
         self.current_output_csv_path = path
         if self._is_postprocessing_stage():
             self.current_latest_csv_path = path
         else:
             self.current_raw_csv_path = path
-        self.output_csv_edit.setText(str(path))
+        with QSignalBlocker(self.annotation_csv_path_edit):
+            self.annotation_csv_path_edit.setText(str(path))
         self.stage_label.setText(f"Stage: {self._current_stage().value}")
+        return submission
+
+    def _require_save_success(
+        self,
+        submission: SaveSubmission | None,
+        *,
+        context: str,
+        timeout_ms: int = 30000,
+    ) -> None:
+        """Wait for one exact snapshot before a dependent background I/O step."""
+
+        if submission is None:
+            raise RuntimeError(f"No save target is available for the {context}.")
+        if not submission.accepted:
+            raise OSError(
+                f"Could not queue the {context} ({submission.status.value}): "
+                f"{submission.detail or 'save request was rejected'}"
+            )
+        result = self.csv_save_worker.wait_for_revision(
+            submission.path,
+            submission.revision,
+            timeout_ms=timeout_ms,
+        )
+        if not result.succeeded:
+            raise OSError(
+                f"Could not persist the {context} ({result.status.value}): "
+                f"{result.detail or 'save did not complete successfully'}"
+            )
+
+    def _on_save_completed(self, path: str, revision: int) -> None:
+        self._last_saved_revision_by_path[str(Path(path).resolve())] = int(revision)
+        if self.current_output_csv_path is not None and Path(path).resolve() == self.current_output_csv_path.resolve():
+            self.statusBar().showMessage(f"Saved CSV in background: {path}", 2500)
+
+    def _on_save_failed(self, path: str, revision: int, error_message: str) -> None:
+        del revision
+        self.statusBar().showMessage(f"CSV save failed for {path}: {error_message}", 12000)
 
     def _refresh_preview(self) -> None:
         if not self.current_provider:
+            self._invalidate_preview_requests()
+            self.preview_timer.stop()
+            self.preview_worker.discard_pending()
             self.canvas.clear()
             return
 
-        try:
-            frame_rgb = self.current_provider.get_frame(self.current_frame_index)
-            frame_records = self._current_frame_records()
-            prompt_spec = self._current_prompt_spec() if self._is_detection_stage() else None
-            preview = self.detector.render_frame_preview(
-                frame_rgb=frame_rgb,
-                records=frame_records,
+        delay = max(0, int(self.runtime_config.preview_debounce_ms))
+        if self.frame_slider.isSliderDown():
+            # PreviewWorker is already latest-wins: every submit replaces the
+            # single pending request. Feeding it directly while scrubbing keeps
+            # the decoder busy without building a queue or waiting for a timer.
+            self.preview_timer.stop()
+            self._submit_preview_request()
+        elif delay == 0:
+            self._submit_preview_request()
+        else:
+            self.preview_timer.start(delay)
+
+    def _submit_preview_request(self, scrubbing: bool | None = None) -> None:
+        provider = self.current_provider
+        if provider is None:
+            return
+        is_scrubbing = self.frame_slider.isSliderDown() if scrubbing is None else bool(scrubbing)
+        self._preview_request_seq += 1
+        request_seq = self._preview_request_seq
+        self._latest_preview_request_seq = request_seq
+        # A scrub request changes decode scheduling only. It still carries an
+        # immutable snapshot of every record on that exact frame so the worker
+        # always publishes the original image plus the complete 3D BBX layer.
+        prompt_spec = self._current_prompt_spec().clone() if self._is_detection_stage() else None
+        intrinsics_override = None
+        if self.use_actual_k_checkbox.isChecked():
+            try:
+                intrinsics_override = self._current_detection_config().to_intrinsics_matrix()
+            except Exception:
+                intrinsics_override = None
+        records = clone_records(self._current_frame_records())
+        highlight_det_id = self._selected_det_id()
+        self.preview_worker.submit(
+            PreviewRequest(
+                generation=request_seq,
+                # The stable provider.source_id is intentionally used in CSV
+                # records, but preview validity also needs an instance token so
+                # reopening the same path cannot display a retired decode.
+                source_id=self._preview_provider_token(provider),
+                provider=provider,
+                frame_index=self.current_frame_index,
+                scrubbing=is_scrubbing,
+                records=records,
                 prompt_spec=prompt_spec,
-                highlight_det_id=self._selected_det_id(),
-                intrinsics_override=self._preview_intrinsics_for_current_view(frame_rgb.shape[:2]),
+                highlight_det_id=highlight_det_id,
+                intrinsics_override=intrinsics_override,
             )
-            self.canvas.set_image(preview)
-            self.canvas.set_detection_boxes([])
-            self.canvas.set_highlight_box(None)
-            self.canvas.set_prompt_box(
-                self.current_prompt_box
-                if self._is_detection_stage() and self.current_prompt_mode() in {PromptMode.BOX_MULTI, PromptMode.BOX_SINGLE}
-                else None
-            )
-            self.canvas.set_prompt_points(
-                self.current_prompt_points if self._is_detection_stage() and self.current_prompt_mode() == PromptMode.POINT else []
-            )
-        except Exception as exc:
+        )
+
+    def _on_preview_ready(
+        self,
+        request_seq: int,
+        source_id: str,
+        frame_index: int,
+        scrubbing: bool,
+        qimage: object,
+    ) -> None:
+        if not self._should_display_preview(request_seq, source_id, frame_index, scrubbing):
+            self._schedule_retired_provider_close()
+            return
+        self._last_displayed_preview_seq = int(request_seq)
+        self.canvas.set_qimage(qimage)
+        self.canvas.set_detection_boxes([])
+        self.canvas.set_highlight_box(None)
+        self.canvas.set_prompt_box(
+            self.current_prompt_box
+            if self._is_detection_stage() and self.current_prompt_mode() in {PromptMode.BOX_MULTI, PromptMode.BOX_SINGLE}
+            else None
+        )
+        self.canvas.set_prompt_points(
+            self.current_prompt_points
+            if self._is_detection_stage() and self.current_prompt_mode() == PromptMode.POINT
+            else []
+        )
+        self._schedule_retired_provider_close()
+
+    def _should_display_preview(
+        self,
+        request_seq: int,
+        source_id: str,
+        frame_index: int,
+        scrubbing: bool,
+    ) -> bool:
+        """Accept live scrub frames while keeping normal refreshes exact."""
+
+        provider = self.current_provider
+        normalized_seq = int(request_seq)
+        if provider is None or source_id != self._preview_provider_token(provider):
+            return False
+        if normalized_seq <= self._last_displayed_preview_seq:
+            return False
+        if scrubbing:
+            # The handle may already be ahead of this decoded frame. Displaying
+            # the newest completed request produces continuous visual feedback;
+            # PreviewWorker guarantees generations arrive from one worker in
+            # order and keeps only the latest pending request.
+            return self.frame_slider.isSliderDown()
+        return (
+            normalized_seq == self._latest_preview_request_seq
+            and int(frame_index) == self.current_frame_index
+        )
+
+    @staticmethod
+    def _preview_provider_token(provider: object) -> str:
+        return f"{getattr(provider, 'source_id', '')}:{id(provider):x}"
+
+    def _on_preview_failed(
+        self,
+        request_seq: int,
+        source_id: str,
+        frame_index: int,
+        scrubbing: bool,
+        error_message: str,
+    ) -> None:
+        if scrubbing:
+            return
+        provider = self.current_provider
+        if (
+            provider is not None
+            and int(request_seq) == self._latest_preview_request_seq
+            and source_id == self._preview_provider_token(provider)
+            and int(frame_index) == self.current_frame_index
+        ):
             self.canvas.clear()
-            self.statusBar().showMessage(f"Preview refresh failed: {exc}", 8000)
+            self.statusBar().showMessage(f"Preview refresh failed: {error_message}", 8000)
+        self._schedule_retired_provider_close()
+
+    def _invalidate_preview_requests(self) -> None:
+        self._preview_request_seq += 1
+        self._latest_preview_request_seq = self._preview_request_seq
 
     def _refresh_table(self, preserve_det_id: str | None = None) -> None:
         frame_records = self._current_frame_records()
@@ -2352,10 +2837,12 @@ class MainWindow(QMainWindow):
                     if editable and value_kind != "bool" and allow_edit:
                         flags |= Qt.ItemFlag.ItemIsEditable
                     if value_kind == "bool":
-                        if allow_edit:
+                        if field_name == "is_visible" or allow_edit:
                             flags |= Qt.ItemFlag.ItemIsUserCheckable
                         item.setFlags(flags)
-                        item.setCheckState(Qt.CheckState.Checked if record.is_enabled else Qt.CheckState.Unchecked)
+                        item.setCheckState(
+                            Qt.CheckState.Checked if bool(getattr(record, field_name)) else Qt.CheckState.Unchecked
+                        )
                     else:
                         item.setFlags(flags)
                         item.setText(self._format_result_field(record, field_name, value_kind))
@@ -2382,22 +2869,16 @@ class MainWindow(QMainWindow):
             self.results_hint_label.setText("No detections exist in the current frame.")
         else:
             self.results_hint_label.setText(
-                "Double-click editable cells to update 3D boxes. "
-                "Only checked rows are visualized on the left."
+                "Show only controls preview visibility. Enabled controls filtering, tracking, and export participation."
             )
         self._sync_selection_inputs()
 
     def _current_frame_records(self) -> list[DetectionRecord]:
-        records = [record for record in self.records if record.frame_index == self.current_frame_index]
-        return sorted(records, key=lambda record: (-record.score, record.det_id))
+        return self.record_index.for_frame(self.current_frame_index)
 
     def _load_csv_side_inputs(self) -> None:
         self.stage_label.setText(f"Stage: {self._current_stage().value}")
-        with QSignalBlocker(self.annotation_csv_path_edit):
-            if self.current_annotation_csv_override_path is not None:
-                self.annotation_csv_path_edit.setText(str(self.current_annotation_csv_override_path))
-            else:
-                self.annotation_csv_path_edit.clear()
+        self._refresh_output_path_display()
         self._update_action_states()
 
     def _save_csv_now(self) -> None:
@@ -2405,11 +2886,12 @@ class MainWindow(QMainWindow):
             self._show_warning("No Source", "Load a dataset, video, or image folder first.")
             return
         self._persist_active_records()
-        self.statusBar().showMessage("CSV saved.", 4000)
+        self.statusBar().showMessage("CSV save queued.", 4000)
 
     def _autosave(self) -> None:
         if self.current_provider is not None and self.current_output_csv_path is not None:
-            self._persist_active_records()
+            self.record_index.rebuild(self.records)
+            self.autosave_timer.start(self.runtime_config.autosave_debounce_ms)
 
     def _open_result_folder(self) -> None:
         target = self.current_result_dir
@@ -2478,6 +2960,19 @@ class MainWindow(QMainWindow):
     def _on_frame_slider_changed(self, value: int) -> None:
         self._set_current_frame(int(value))
 
+    def _on_frame_slider_released(self) -> None:
+        """Render the exact final scrub position without another debounce."""
+
+        if self.current_provider is None:
+            return
+        self.preview_timer.stop()
+        # Heavy tables and record summaries are intentionally deferred during
+        # the drag and committed once at the exact final position.
+        self._refresh_table()
+        self._refresh_info_panel()
+        self._update_action_states()
+        self._submit_preview_request(scrubbing=False)
+
     def _on_frame_spin_changed(self, value: int) -> None:
         self._set_current_frame(int(value))
 
@@ -2494,6 +2989,13 @@ class MainWindow(QMainWindow):
         with QSignalBlocker(self.frame_slider), QSignalBlocker(self.frame_index_spin):
             self.frame_slider.setValue(frame_index)
             self.frame_index_spin.setValue(frame_index)
+        if self.frame_slider.isSliderDown():
+            # Keep non-visual widgets out of the mouse path. The preview itself
+            # remains full fidelity: source frame + all 3D bounding boxes.
+            # QTableWidget rebuilds and O(N) summaries happen once on release.
+            self._refresh_frame_labels()
+            self._refresh_preview()
+            return
         self._refresh_current_frame_view()
         self._update_action_states()
 
@@ -2580,16 +3082,21 @@ class MainWindow(QMainWindow):
             config=config,
             source_context=self.current_source_context,
             replace_target_id=replace_target_id,
+            release_models_after_run=not self.runtime_config.keep_model_loaded,
             parent=self,
         )
         self.detection_worker.progressChanged.connect(self._on_run_progress)
         self.detection_worker.runCompleted.connect(self._on_run_completed)
         self.detection_worker.runFailed.connect(self._on_run_failed)
+        self.detection_worker.finished.connect(self._on_detection_finished)
 
         self._set_running_state(True)
-        self.model_status_text = "Running detection (loading model on demand)"
+        model_cached = self.detector.has_model_variant(not config.use_actual_intrinsics)
+        self.model_status_text = "Running detection (cached model)" if model_cached else "Running detection (loading model)"
         self._refresh_info_panel()
-        self.statusBar().showMessage("Detection started. Loading model on demand...")
+        self.statusBar().showMessage(
+            "Detection started with cached model." if model_cached else "Detection started. Loading model..."
+        )
         self.detection_worker.start()
 
     def _cancel_run(self) -> None:
@@ -2600,23 +3107,29 @@ class MainWindow(QMainWindow):
         if self.tracking_worker and self.tracking_worker.isRunning():
             self.tracking_worker.cancel()
             self.statusBar().showMessage("Tracking cancel requested...", 4000)
+            return
+        if self.outlier_worker and self.outlier_worker.isRunning():
+            self.outlier_worker.cancel()
+            self.statusBar().showMessage("Outlier analysis cancel requested...", 4000)
+            return
+        if self.source_load_worker and self.source_load_worker.isRunning():
+            self.source_load_worker.cancel()
+            self.statusBar().showMessage("Source loading cancel requested...", 4000)
 
     def _on_run_progress(self, current: int, total: int, message: str) -> None:
+        if self._close_requested:
+            return
         self.progress_bar.setRange(0, max(1, total))
         self.progress_bar.setValue(min(current, total))
         self.progress_bar.setFormat(f"{message} ({current}/{total})")
         self.statusBar().showMessage(message)
 
     def _on_run_completed(self, payload: object) -> None:
+        if self._close_requested:
+            return
         data = dict(payload)
-        worker = self.detection_worker
-        self.detection_worker = None
-        if worker is not None:
-            worker.deleteLater()
-        self._set_running_state(False)
-
         if data.get("canceled"):
-            self.model_status_text = "Model idle (GPU released)"
+            self.model_status_text = self._idle_model_status()
             self.statusBar().showMessage("Detection canceled.", 5000)
             self._set_idle_progress("Canceled")
             self._refresh_info_panel()
@@ -2644,24 +3157,31 @@ class MainWindow(QMainWindow):
             self._refresh_preview()
             self._refresh_track_table()
             self._set_idle_progress("Done")
-            self.model_status_text = "Model idle (GPU released)"
+            self.model_status_text = self._idle_model_status()
             self.statusBar().showMessage("Detection finished.", 5000)
         except Exception as exc:
             self._show_warning("Result Merge Failed", str(exc))
             self._set_idle_progress("Failed")
-            self.model_status_text = "Model idle (GPU released)"
+            self.model_status_text = self._idle_model_status()
         self._refresh_info_panel()
 
     def _on_run_failed(self, error_message: str) -> None:
+        if self._close_requested:
+            return
+        self._set_idle_progress("Failed")
+        self.model_status_text = self._idle_model_status()
+        self._show_warning("Detection Failed", error_message)
+        self._refresh_info_panel()
+
+    def _on_detection_finished(self) -> None:
         worker = self.detection_worker
         self.detection_worker = None
         if worker is not None:
             worker.deleteLater()
         self._set_running_state(False)
-        self._set_idle_progress("Failed")
-        self.model_status_text = "Model idle (GPU released)"
-        self._show_warning("Detection Failed", error_message)
-        self._refresh_info_panel()
+
+    def _idle_model_status(self) -> str:
+        return "Model idle (cached)" if self.runtime_config.keep_model_loaded else "Model idle (released)"
 
     def _merge_run_results(
         self,
@@ -2691,6 +3211,7 @@ class MainWindow(QMainWindow):
         replacement.track_id = original.track_id
         replacement.track_status = original.track_status
         replacement.is_enabled = original.is_enabled
+        replacement.is_visible = original.is_visible
         self.records[target_index] = replacement
 
     def _selected_det_id(self) -> str | None:
@@ -2710,10 +3231,7 @@ class MainWindow(QMainWindow):
         return self._record_by_det_id(det_id)
 
     def _record_by_det_id(self, det_id: str) -> DetectionRecord | None:
-        for record in self.records:
-            if record.det_id == det_id:
-                return record
-        return None
+        return self.record_index.by_id(det_id)
 
     def _on_results_selection_changed(self) -> None:
         self._sync_selection_inputs()
@@ -2724,8 +3242,6 @@ class MainWindow(QMainWindow):
 
     def _on_results_table_item_changed(self, item: QTableWidgetItem) -> None:
         if self._results_table_internal_change:
-            return
-        if not self._is_postprocessing_stage():
             return
         det_id = item.data(Qt.ItemDataRole.UserRole)
         if not det_id:
@@ -2739,6 +3255,8 @@ class MainWindow(QMainWindow):
         _, field_name, value_kind, editable = RESULTS_TABLE_COLUMNS[column]
         if not editable:
             return
+        if field_name != "is_visible" and not self._is_postprocessing_stage():
+            return
         self._commit_results_item_change(record, item, field_name, value_kind)
 
     def _commit_results_item_change(
@@ -2748,7 +3266,9 @@ class MainWindow(QMainWindow):
         field_name: str,
         value_kind: str,
     ) -> None:
-        before = clone_records(self.records)
+        # Visibility is presentation-only and has no undo/persistence effect;
+        # avoid cloning the entire dataset for this high-frequency toggle.
+        before = None if field_name == "is_visible" else clone_records(self.records)
         proposed_value: object = (
             item.checkState() == Qt.CheckState.Checked if value_kind == "bool" else item.text().strip()
         )
@@ -2766,9 +3286,15 @@ class MainWindow(QMainWindow):
         if not changed:
             return
 
-        self.postprocess_session.push_undo_snapshot(before)
+        if field_name == "is_visible":
+            self._refresh_preview()
+            self._refresh_info_panel()
+            return
+
+        assert before is not None
+        self.postprocess_session.push_undo_snapshot(before, snapshot_owned=True)
         self._autosave()
-        self._refresh_outlier_analysis()
+        self._invalidate_outlier_analysis()
         self._refresh_preview()
         self._refresh_track_table()
         self._refresh_info_panel()
@@ -2785,6 +3311,8 @@ class MainWindow(QMainWindow):
         try:
             if value_kind == "bool":
                 setattr(record, field_name, bool(proposed_value))
+                if field_name == "is_enabled" and not record.is_enabled:
+                    record.is_visible = False
             elif value_kind == "float":
                 parsed_value = float(str(proposed_value).strip())
                 if not np.isfinite(parsed_value):
@@ -2845,10 +3373,18 @@ class MainWindow(QMainWindow):
         return None
 
     def _intrinsics_for_record_projection(self, record: DetectionRecord) -> np.ndarray:
+        actual_intrinsics = None
         if self.use_actual_k_checkbox.isChecked():
-            intrinsics = self._current_detection_config().to_intrinsics_matrix()
-            if intrinsics is not None:
-                return intrinsics
+            actual_intrinsics = self._current_detection_config().to_intrinsics_matrix()
+        return self._record_projection_intrinsics(record, actual_intrinsics)
+
+    @staticmethod
+    def _record_projection_intrinsics(
+        record: DetectionRecord,
+        actual_intrinsics: np.ndarray | None,
+    ) -> np.ndarray:
+        if actual_intrinsics is not None:
+            return actual_intrinsics
         if None not in (record.pred_fx, record.pred_fy, record.pred_cx, record.pred_cy):
             return np.array(
                 [
@@ -2904,11 +3440,13 @@ class MainWindow(QMainWindow):
 
     def _refresh_output_path_display(self) -> None:
         if self.current_output_csv_path is not None:
-            self.output_csv_edit.setText(str(self.current_output_csv_path))
+            with QSignalBlocker(self.annotation_csv_path_edit):
+                self.annotation_csv_path_edit.setText(str(self.current_output_csv_path))
             return
         config = self.dataset_config
         if config is None:
-            self.output_csv_edit.clear()
+            with QSignalBlocker(self.annotation_csv_path_edit):
+                self.annotation_csv_path_edit.clear()
             return
         mode = self.current_source_mode()
         try:
@@ -2931,7 +3469,8 @@ class MainWindow(QMainWindow):
                 path = None
         except Exception:
             path = None
-        self.output_csv_edit.setText(str(path) if path else "")
+        with QSignalBlocker(self.annotation_csv_path_edit):
+            self.annotation_csv_path_edit.setText(str(path) if path else "")
 
     def _refresh_info_panel(self) -> None:
         lines = [f"Model: {self.model_status_text}"]
@@ -2959,11 +3498,12 @@ class MainWindow(QMainWindow):
         if self.current_result_dir is not None:
             lines.append(f"Result Folder: {self.current_result_dir}")
         lines.append(f"Detections Loaded: {len(self.records)}")
+        lines.append(f"Visible Detections: {sum(1 for record in self.records if record.is_visible)}")
         lines.append(f"Enabled Detections: {sum(1 for record in self.records if record.is_enabled)}")
         lines.append(f"Outlier Hits: {len(self.outlier_hits_global)}")
         lines.append(f"Outlier Frames: {len(self.outlier_frames)}")
-        if self.outlier_refresh_deferred:
-            lines.append("Outlier Status: deferred")
+        lines.append(f"Outlier Status: {self.outlier_analysis_state}")
+        lines.append(f"Outlier Rules Enabled: {len(self._enabled_outlier_rule_ids())}")
         lines.append(
             f"Intrinsics Mode: {'actual' if self.use_actual_k_checkbox.isChecked() else 'predicted'}"
         )
@@ -2975,7 +3515,8 @@ class MainWindow(QMainWindow):
         has_track_selection = self._selected_track_id() is not None
         detection_running = self._is_detection_running()
         tracking_running = self._is_tracking_running()
-        running = self._controls_locked or detection_running or tracking_running
+        outlier_running = self._is_outlier_running()
+        running = self._controls_locked or detection_running or tracking_running or outlier_running
         postprocessing = self._is_postprocessing_stage()
         detection_stage = self._is_detection_stage()
 
@@ -2991,14 +3532,13 @@ class MainWindow(QMainWindow):
 
         self.run_current_btn.setEnabled(has_source and detection_stage and not running)
         self.run_range_btn.setEnabled(has_source and detection_stage and not running)
-        self.cancel_run_btn.setEnabled(detection_running or tracking_running)
+        self.cancel_run_btn.setEnabled(
+            detection_running or tracking_running or outlier_running or self._is_source_loading()
+        )
         self.annotation_csv_path_edit.setEnabled(not running)
         self.browse_annotation_csv_btn.setEnabled(not running)
         self.load_annotation_csv_btn.setEnabled(
             has_source and not running and bool(self.annotation_csv_path_edit.text().strip())
-        )
-        self.use_source_csv_btn.setEnabled(
-            has_source and not running and self.current_source_output_csv_path is not None
         )
         self.save_csv_btn.setEnabled(has_source and not running)
         self.open_result_folder_btn.setEnabled(self.current_result_dir is not None)
@@ -3111,12 +3651,81 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, title, message)
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
-        if self.detection_worker and self.detection_worker.isRunning():
-            self.detection_worker.cancel()
-            self.detection_worker.wait()
-        if self.tracking_worker and self.tracking_worker.isRunning():
-            self.tracking_worker.cancel()
-            self.tracking_worker.wait()
+        if not self._close_requested:
+            self._close_requested = True
+            self.centralWidget().setEnabled(False)
+            if self.autosave_timer.isActive():
+                self.autosave_timer.stop()
+            if self.detection_worker and self.detection_worker.isRunning():
+                self.detection_worker.cancel()
+            if self.tracking_worker and self.tracking_worker.isRunning():
+                self.tracking_worker.cancel()
+            if self.outlier_worker and self.outlier_worker.isRunning():
+                self.outlier_worker.cancel()
+            if self.source_load_worker and self.source_load_worker.isRunning():
+                self.source_load_worker.cancel()
+            self.preview_worker.discard_pending()
+
+        # Phase 1: let record-producing and path-mutating workers finish. Their
+        # result slots ignore late results while closing. Only then is the
+        # stable in-memory snapshot submitted to the writer, so an I/O task can
+        # never race the final save.
+        if self._is_background_task_running() or not self.preview_worker.wait_until_idle(timeout_ms=0):
+            event.ignore()
+            self.statusBar().showMessage("Finishing background work before closing...")
+            self._schedule_close_retry()
+            return
+
+        if self._close_save_submission is None and not self._close_final_save_queued:
+            self._close_save_submission = self._persist_active_records()
+
+        submission = self._close_save_submission
+        if submission is not None and not self._close_final_save_queued:
+            result = self.csv_save_worker.status_for_revision(submission.path, submission.revision)
+            if result.status in {SaveStatus.PENDING, SaveStatus.ACTIVE}:
+                event.ignore()
+                self.statusBar().showMessage("Saving final CSV before closing...")
+                self._schedule_close_retry()
+                return
+            if result.status is not SaveStatus.SUCCEEDED:
+                self._close_requested = False
+                self._close_save_submission = None
+                self.centralWidget().setEnabled(True)
+                event.ignore()
+                self._show_warning(
+                    "Final Save Failed",
+                    "CamLabel3D stayed open because the final CSV was not saved.\n\n"
+                    f"Status: {result.status.value}\n"
+                    f"Details: {result.detail or submission.detail or 'unknown error'}",
+                )
+                return
+
+        if not self._close_final_save_queued:
+            self.preview_worker.stop()
+            self.csv_save_worker.stop()
+            self._close_final_save_queued = True
+
+        # Phase 2: CSVSaveWorker drains all accepted revisions before stopping.
+        if self.preview_worker.isRunning() or self.csv_save_worker.isRunning():
+            event.ignore()
+            self.statusBar().showMessage("Saving final CSV before closing...")
+            self._schedule_close_retry()
+            return
+
         self.detector.release_models()
+        self._close_retired_providers()
         self._close_provider()
         super().closeEvent(event)
+
+    def _schedule_close_retry(self) -> None:
+        """Schedule one non-blocking close poll, never an accumulating chain."""
+
+        if self._close_retry_scheduled:
+            return
+        self._close_retry_scheduled = True
+
+        def retry() -> None:
+            self._close_retry_scheduled = False
+            self.close()
+
+        QTimer.singleShot(100, retry)

@@ -252,6 +252,7 @@ class DetectionRecord:
     size_l: float
     size_h: float
     is_enabled: bool = True
+    is_visible: bool | None = None
     track_id: str = ""
     track_status: str = ""
     det_id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -275,6 +276,13 @@ class DetectionRecord:
     pred_cx: float | None = None
     pred_cy: float | None = None
     use_actual_intrinsics: bool = False
+
+    def __post_init__(self) -> None:
+        self.is_enabled = bool(self.is_enabled)
+        if self.is_visible is None:
+            self.is_visible = self.is_enabled
+        else:
+            self.is_visible = bool(self.is_visible)
 
     @staticmethod
     def new_det_id() -> str:
