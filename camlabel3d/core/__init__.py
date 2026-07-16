@@ -1,5 +1,19 @@
 """Core domain models and runtime services for CamLabel3D."""
 
+from .bev import (
+    DEFAULT_TRAJECTORY_WINDOW_FRAMES,
+    BEVArrow,
+    BEVBox,
+    BEVCurrentPose,
+    BEVScene,
+    BEVTrajectorySample,
+    BEVViewport,
+    build_bev_scene,
+    derive_bev_overview_path,
+    render_bev_overview,
+    select_default_bev_frame_index,
+    select_default_bev_track_id,
+)
 from .detector import DetectorAdapter
 from .frame_provider import (
     FrameProvider,
@@ -43,9 +57,16 @@ from .source_config import DatasetConfigStore, DatasetSourceConfig, DatasetSourc
 from .tracking import TrackingConfig, TrackingEngine
 
 __all__ = [
+    "BEVArrow",
+    "BEVBox",
+    "BEVCurrentPose",
+    "BEVScene",
+    "BEVTrajectorySample",
+    "BEVViewport",
     "DatasetConfigStore",
     "DatasetSourceConfig",
     "DatasetSourcesConfig",
+    "DEFAULT_TRAJECTORY_WINDOW_FRAMES",
     "DetectionConfig",
     "DetectionRecord",
     "DetectorAdapter",
@@ -80,10 +101,15 @@ __all__ = [
     "VideoFrameProvider",
     "WorkflowStage",
     "apply_track_batch_edit",
+    "build_bev_scene",
     "build_default_bulk_operation_registry",
     "build_default_outlier_registry",
     "clone_records",
+    "derive_bev_overview_path",
     "hits_to_report_json",
     "open_media_source",
+    "render_bev_overview",
+    "select_default_bev_frame_index",
+    "select_default_bev_track_id",
     "track_batch_records",
 ]

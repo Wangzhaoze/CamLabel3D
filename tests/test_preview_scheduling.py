@@ -7,7 +7,10 @@ import pytest
 
 pytest.importorskip("PySide6")
 
-from camlabel3d.ui.main_window import MainWindow
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication, QSlider, QSpinBox
+
+from camlabel3d.ui.main_window import MainWindow, PreviewMode
 from camlabel3d.core.models import DetectionRecord, PromptSpec
 
 
@@ -62,6 +65,10 @@ class _PreviewHarness:
 
     def _update_action_states(self) -> None:
         self.action_refreshes += 1
+
+    @staticmethod
+    def _current_preview_mode() -> PreviewMode:
+        return PreviewMode.RGB
 
 
 def test_live_scrubbing_submits_every_latest_position_without_timer_queue() -> None:
@@ -186,6 +193,13 @@ def _record(frame_index: int, det_id: str) -> DetectionRecord:
     )
 
 
+def _tracked_record(frame_index: int, det_id: str, *, track_id: str, score: float) -> DetectionRecord:
+    record = _record(frame_index, det_id)
+    record.track_id = track_id
+    record.score = score
+    return record
+
+
 class _RequestCollector:
     def __init__(self) -> None:
         self.requests: list[object] = []
@@ -249,3 +263,89 @@ def test_live_scrub_request_carries_current_frame_records_for_3d_overlay() -> No
     # an in-flight 3D overlay request.
     assert request.records is not harness.frame_records
     assert request.records[0] is not harness.frame_records[0]
+
+
+class _BEVFocusHarness:
+    def __init__(self) -> None:
+        self._bev_focus_track_id = ""
+        self.frame_records = [
+            _tracked_record(804, "det-disabled", track_id="", score=0.95),
+            _tracked_record(804, "det-best", track_id="1", score=0.91),
+            _tracked_record(804, "det-other", track_id="7", score=0.72),
+        ]
+        self.frame_records[0].is_enabled = False
+
+    @staticmethod
+    def _selected_track_id() -> None:
+        return None
+
+    @staticmethod
+    def _selected_record() -> None:
+        return None
+
+    def _current_frame_records(self) -> list[DetectionRecord]:
+        return self.frame_records
+
+    def _default_bev_focus_track_id(self) -> str:
+        return MainWindow._default_bev_focus_track_id(self)
+
+
+def test_selected_bev_focus_track_id_defaults_to_best_current_frame_track() -> None:
+    harness = _BEVFocusHarness()
+
+    assert MainWindow._selected_bev_focus_track_id(harness) == "1"
+
+
+class _FrameChangeSlider(QSlider):
+    def __init__(self, *, down: bool) -> None:
+        super().__init__(Qt.Orientation.Horizontal)
+        self._down = down
+
+    def isSliderDown(self) -> bool:  # noqa: N802 - Qt naming
+        return self._down
+
+
+class _FrameChangeHarness:
+    def __init__(self, *, slider_down: bool) -> None:
+        app = QApplication.instance() or QApplication([])
+        del app
+        self.current_provider = SimpleNamespace(frame_count=100)
+        self.current_frame_index = 0
+        self.frame_slider = _FrameChangeSlider(down=slider_down)
+        self.frame_slider.setMinimum(0)
+        self.frame_slider.setMaximum(99)
+        self.frame_index_spin = QSpinBox()
+        self.frame_index_spin.setMinimum(0)
+        self.frame_index_spin.setMaximum(99)
+        self.frame_label_refreshes = 0
+        self.table_refreshes = 0
+        self.preview_refreshes = 0
+        self.current_frame_view_refreshes = 0
+        self.action_refreshes = 0
+
+    def _refresh_frame_labels(self) -> None:
+        self.frame_label_refreshes += 1
+
+    def _refresh_table(self) -> None:
+        self.table_refreshes += 1
+
+    def _refresh_preview(self) -> None:
+        self.preview_refreshes += 1
+
+    def _refresh_current_frame_view(self) -> None:
+        self.current_frame_view_refreshes += 1
+
+    def _update_action_states(self) -> None:
+        self.action_refreshes += 1
+
+
+def test_set_current_frame_keeps_results_table_synced_while_slider_is_held() -> None:
+    harness = _FrameChangeHarness(slider_down=True)
+
+    MainWindow._set_current_frame(harness, 12)
+
+    assert harness.current_frame_index == 12
+    assert harness.frame_label_refreshes == 1
+    assert harness.table_refreshes == 1
+    assert harness.preview_refreshes == 1
+    assert harness.current_frame_view_refreshes == 0

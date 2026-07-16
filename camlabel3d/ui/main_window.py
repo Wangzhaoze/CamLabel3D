@@ -63,11 +63,13 @@ from camlabel3d.core import (
     VideoFrameProvider,
     WorkflowStage,
     apply_track_batch_edit,
+    build_bev_scene,
     clone_records,
 )
 from camlabel3d.io.csv_store import CSVStore
 from camlabel3d.runtime_config import RuntimeConfig
 
+from .bev_canvas import BEVCanvas
 from .bookmark_slider import BookmarkSlider
 from .canvas import FrameCanvas
 from .input_widgets import MenuWheelComboBox, NoWheelDoubleSpinBox, NoWheelSpinBox
@@ -132,6 +134,11 @@ class ActivitySection(str, Enum):
     FILE = "File"
     DETECT = "Detect"
     TRACK = "Track"
+
+
+class PreviewMode(str, Enum):
+    RGB = "rgb"
+    BEV_TRAJECTORY = "bev_trajectory"
 
 
 class MainWindow(QMainWindow):
@@ -226,6 +233,8 @@ class MainWindow(QMainWindow):
         self._preview_request_seq = 0
         self._latest_preview_request_seq = 0
         self._last_displayed_preview_seq = -1
+        self._bev_focus_track_id = ""
+        self._last_bev_viewport_key: tuple[str, str] | None = None
         self._save_revision = 0
         self._last_saved_revision_by_path: dict[str, int] = {}
         self._outlier_generation = 0
@@ -302,8 +311,26 @@ class MainWindow(QMainWindow):
         preview_layout.setContentsMargins(8, 0, 0, 0)
         preview_layout.setSpacing(8)
 
-        self.canvas = FrameCanvas(preview_container)
-        preview_layout.addWidget(self.canvas, stretch=1)
+        preview_header = QHBoxLayout()
+        preview_header.setContentsMargins(0, 0, 0, 0)
+        preview_header.addStretch(1)
+        preview_header.addWidget(QLabel("View", preview_container))
+        self.preview_mode_combo = MenuWheelComboBox(preview_container)
+        self.preview_mode_combo.addItem("RGB", PreviewMode.RGB.value)
+        self.preview_mode_combo.addItem("BEV Trajectory", PreviewMode.BEV_TRAJECTORY.value)
+        self.preview_mode_combo.setMinimumContentsLength(14)
+        preview_header.addWidget(self.preview_mode_combo)
+        self.reset_bev_view_btn = QPushButton("Reset View", preview_container)
+        self.reset_bev_view_btn.setAutoDefault(False)
+        preview_header.addWidget(self.reset_bev_view_btn)
+        preview_layout.addLayout(preview_header)
+
+        self.preview_stack = QStackedWidget(preview_container)
+        self.canvas = FrameCanvas(self.preview_stack)
+        self.bev_canvas = BEVCanvas(self.preview_stack)
+        self.preview_stack.addWidget(self.canvas)
+        self.preview_stack.addWidget(self.bev_canvas)
+        preview_layout.addWidget(self.preview_stack, stretch=1)
 
         self.frame_info_label = QLabel("Frame: -- / --", preview_container)
         self.time_info_label = QLabel("t = --", preview_container)
@@ -907,6 +934,8 @@ class MainWindow(QMainWindow):
         self.frame_slider.valueChanged.connect(self._on_frame_slider_changed)
         self.frame_slider.sliderReleased.connect(self._on_frame_slider_released)
         self.frame_index_spin.valueChanged.connect(self._on_frame_spin_changed)
+        self.preview_mode_combo.currentIndexChanged.connect(self._on_preview_mode_changed)
+        self.reset_bev_view_btn.clicked.connect(self._reset_bev_view)
 
         self.run_current_btn.clicked.connect(self._run_current_frame)
         self.run_range_btn.clicked.connect(self._run_selected_range)
@@ -1851,6 +1880,7 @@ class MainWindow(QMainWindow):
 
         self.stage_label.setText(f"Stage: {stage.value}")
         self.records = []
+        self._bev_focus_track_id = ""
         if reset_frame_index:
             self.current_frame_index = 0
         self._sync_frame_controls()
@@ -1900,6 +1930,7 @@ class MainWindow(QMainWindow):
 
         self.stage_label.setText(f"Stage: {stage.value}")
         self.records = records
+        self._bev_focus_track_id = ""
         if reset_frame_index:
             self.current_frame_index = 0
         self._sync_frame_controls()
@@ -2010,6 +2041,7 @@ class MainWindow(QMainWindow):
         self.current_track_ids = []
         self.current_active_source_path = None
         self.current_annotation_csv_override_path = None
+        self._bev_focus_track_id = ""
         self.active_source_path_edit.clear()
         self.annotation_csv_path_edit.clear()
         if self.track_batch_dialog is not None:
@@ -2018,6 +2050,8 @@ class MainWindow(QMainWindow):
             self.manual_source_path = None
             self.manual_path_edit.clear()
         self.canvas.clear()
+        self.bev_canvas.clear()
+        self._last_bev_viewport_key = None
         self.stage_label.setText(f"Stage: {WorkflowStage.DETECTION.value}")
         self._sync_frame_controls()
         self._clear_outlier_state()
@@ -2106,6 +2140,92 @@ class MainWindow(QMainWindow):
         self._refresh_table()
         self._refresh_preview()
         self._refresh_info_panel()
+
+    def _current_preview_mode(self) -> PreviewMode:
+        if not hasattr(self, "preview_mode_combo"):
+            return PreviewMode.RGB
+        value = self.preview_mode_combo.currentData() or self.preview_mode_combo.currentText() or PreviewMode.RGB.value
+        try:
+            return PreviewMode(str(value))
+        except ValueError:
+            return PreviewMode.RGB
+
+    def _apply_preview_mode_ui(self) -> None:
+        if not hasattr(self, "preview_stack"):
+            return
+        is_bev = self._current_preview_mode() == PreviewMode.BEV_TRAJECTORY
+        self.preview_stack.setCurrentWidget(self.bev_canvas if is_bev else self.canvas)
+        self.reset_bev_view_btn.setVisible(is_bev)
+        self.reset_bev_view_btn.setEnabled(is_bev and self.current_provider is not None and self.bev_canvas.has_scene())
+
+    def _selected_bev_focus_track_id(self) -> str:
+        track_id = str(self._selected_track_id() or "").strip()
+        if track_id:
+            return track_id
+        selected = self._selected_record()
+        if selected is not None:
+            selected_track_id = str(selected.track_id or "").strip()
+            if selected_track_id:
+                return selected_track_id
+        persisted_track_id = str(self._bev_focus_track_id or "").strip()
+        if persisted_track_id:
+            return persisted_track_id
+        return self._default_bev_focus_track_id()
+
+    def _default_bev_focus_track_id(self) -> str:
+        candidates = [
+            record
+            for record in self._current_frame_records()
+            if record.is_enabled and bool(record.is_visible) and str(record.track_id or "").strip()
+        ]
+        if not candidates:
+            return ""
+        best = max(candidates, key=lambda item: (float(item.score), item.det_id))
+        return str(best.track_id or "").strip()
+
+    def _sync_bev_focus_track(self) -> None:
+        track_id = str(self._selected_track_id() or "").strip()
+        if not track_id:
+            selected = self._selected_record()
+            if selected is not None:
+                track_id = str(selected.track_id or "").strip()
+        if track_id:
+            self._bev_focus_track_id = track_id
+
+    def _refresh_bev_preview(self) -> None:
+        if self.current_provider is None:
+            self.bev_canvas.clear()
+            self._bev_focus_track_id = ""
+            self._last_bev_viewport_key = None
+            self._apply_preview_mode_ui()
+            return
+        scene = build_bev_scene(
+            self.records,
+            frame_index=self.current_frame_index,
+            focus_track_id=self._selected_bev_focus_track_id(),
+            focus_det_id=self._selected_det_id() or "",
+            trajectory_window_frames=0,
+        )
+        viewport_key = (self._preview_provider_token(self.current_provider), scene.focus_track_id)
+        reset_view = self._last_bev_viewport_key != viewport_key or not self.bev_canvas.has_scene()
+        self.bev_canvas.set_scene(scene, reset_view=reset_view)
+        self._last_bev_viewport_key = viewport_key
+        self._apply_preview_mode_ui()
+
+    def _on_preview_mode_changed(self) -> None:
+        self._apply_preview_mode_ui()
+        if self._current_preview_mode() == PreviewMode.BEV_TRAJECTORY:
+            self.preview_timer.stop()
+            self.preview_worker.discard_pending()
+            self._refresh_bev_preview()
+            return
+        self._refresh_preview(immediate=True)
+
+    def _reset_bev_view(self) -> None:
+        if self._current_preview_mode() != PreviewMode.BEV_TRAJECTORY:
+            return
+        self.bev_canvas.reset_view()
+        self._apply_preview_mode_ui()
 
     def _current_stage(self) -> WorkflowStage:
         return self.postprocess_session.stage
@@ -2214,6 +2334,8 @@ class MainWindow(QMainWindow):
 
     def _on_track_selection_changed(self) -> None:
         selected_track_id = self._selected_track_id() or ""
+        if selected_track_id:
+            self._bev_focus_track_id = selected_track_id
         with QSignalBlocker(self.merge_target_combo):
             for index in range(self.merge_target_combo.count()):
                 candidate = str(self.merge_target_combo.itemData(index) or "").strip()
@@ -2222,6 +2344,8 @@ class MainWindow(QMainWindow):
                     break
         self._refresh_track_batch_editor(selected_track_id=selected_track_id or None)
         self._update_action_states()
+        if self._current_preview_mode() == PreviewMode.BEV_TRAJECTORY:
+            self._refresh_preview()
 
     def _refresh_track_batch_editor(
         self,
@@ -2680,15 +2804,28 @@ class MainWindow(QMainWindow):
         del revision
         self.statusBar().showMessage(f"CSV save failed for {path}: {error_message}", 12000)
 
-    def _refresh_preview(self) -> None:
+    def _refresh_preview(self, *, immediate: bool = False) -> None:
         if not self.current_provider:
             self._invalidate_preview_requests()
             self.preview_timer.stop()
             self.preview_worker.discard_pending()
             self.canvas.clear()
+            self.bev_canvas.clear()
+            self._last_bev_viewport_key = None
+            self._apply_preview_mode_ui()
+            return
+
+        if self._current_preview_mode() == PreviewMode.BEV_TRAJECTORY:
+            self.preview_timer.stop()
+            self.preview_worker.discard_pending()
+            self._refresh_bev_preview()
             return
 
         delay = max(0, int(self.runtime_config.preview_debounce_ms))
+        if immediate:
+            self.preview_timer.stop()
+            self._submit_preview_request(scrubbing=False)
+            return
         if self.frame_slider.isSliderDown():
             # PreviewWorker is already latest-wins: every submit replaces the
             # single pending request. Feeding it directly while scrubbing keeps
@@ -2971,7 +3108,10 @@ class MainWindow(QMainWindow):
         self._refresh_table()
         self._refresh_info_panel()
         self._update_action_states()
-        self._submit_preview_request(scrubbing=False)
+        if self._current_preview_mode() == PreviewMode.BEV_TRAJECTORY:
+            self._refresh_bev_preview()
+        else:
+            self._submit_preview_request(scrubbing=False)
 
     def _on_frame_spin_changed(self, value: int) -> None:
         self._set_current_frame(int(value))
@@ -2990,10 +3130,10 @@ class MainWindow(QMainWindow):
             self.frame_slider.setValue(frame_index)
             self.frame_index_spin.setValue(frame_index)
         if self.frame_slider.isSliderDown():
-            # Keep non-visual widgets out of the mouse path. The preview itself
-            # remains full fidelity: source frame + all 3D bounding boxes.
-            # QTableWidget rebuilds and O(N) summaries happen once on release.
+            # Keep heavyweight summaries out of the mouse path, but keep the
+            # frame-local results table synchronized with the visible preview.
             self._refresh_frame_labels()
+            self._refresh_table()
             self._refresh_preview()
             return
         self._refresh_current_frame_view()
@@ -3234,6 +3374,7 @@ class MainWindow(QMainWindow):
         return self.record_index.by_id(det_id)
 
     def _on_results_selection_changed(self) -> None:
+        self._sync_bev_focus_track()
         self._sync_selection_inputs()
         self._refresh_preview()
 
@@ -3521,6 +3662,7 @@ class MainWindow(QMainWindow):
         detection_stage = self._is_detection_stage()
 
         self.navigation_widget.setEnabled(has_source and not detection_running)
+        self.preview_mode_combo.setEnabled(has_source and not detection_running)
         self.prompt_group.setEnabled(has_source and detection_stage and not running)
         self.detection_params_group.setEnabled(has_source and detection_stage and not running)
         self.source_group.setEnabled(not running)
@@ -3592,6 +3734,7 @@ class MainWindow(QMainWindow):
         self.merge_track_btn.setEnabled(
             has_track_selection and postprocessing and not running and bool(merge_target) and merge_target != selected_track_id
         )
+        self._apply_preview_mode_ui()
 
     def _set_running_state(self, running: bool) -> None:
         self._controls_locked = bool(running)

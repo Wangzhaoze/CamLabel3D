@@ -21,6 +21,7 @@ camlabel3d = "camlabel3d.app:main"
 
 [project.scripts]
 camlabel3d-postprocess = "camlabel3d.postprocess_cli:main"
+camlabel3d-bev-overview = "camlabel3d.bev_overview_cli:main"
 
 [project.optional-dependencies]
 dev = [
@@ -69,4 +70,3 @@ extend-exclude = [
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F"]
-
