@@ -22,6 +22,7 @@ camlabel3d = "camlabel3d.app:main"
 [project.scripts]
 camlabel3d-postprocess = "camlabel3d.postprocess_cli:main"
 camlabel3d-bev-overview = "camlabel3d.bev_overview_cli:main"
+camlabel3d-trajectory-compare = "camlabel3d.trajectory_compare_cli:main"
 
 [project.optional-dependencies]
 dev = [

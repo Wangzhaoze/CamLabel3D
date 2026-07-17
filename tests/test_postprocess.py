@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from camlabel3d.core.models import DetectionRecord
-from camlabel3d.core.postprocess import FilterConfig, PostprocessSession, WorkflowStage
+from camlabel3d.core.postprocess import BBoxFilterRule, FilterConfig, PostprocessSession, WorkflowStage
 from camlabel3d.io.csv_store import CSVStore
 
 
@@ -164,6 +164,32 @@ class PostprocessSessionTests(unittest.TestCase):
         self.assertEqual(disabled, 2)
         self.assertTrue(all(not record.is_enabled for record in records))
         self.assertTrue(all(not record.is_visible for record in records))
+
+    def test_generic_filter_rules_use_and_semantics_and_only_disable_rows(self) -> None:
+        records = [
+            make_record(frame_index=0, score=0.9, center_z=12.0),
+            make_record(frame_index=1, score=0.4, center_z=10.0),
+            make_record(frame_index=2, score=0.8, center_z=30.0),
+        ]
+        session = PostprocessSession()
+
+        disabled = session.apply_filter(
+            records,
+            FilterConfig(
+                rules=(
+                    BBoxFilterRule("score", min_enabled=True, min_value=0.5),
+                    BBoxFilterRule("center_z", max_enabled=True, max_value=20.0),
+                )
+            ),
+        )
+
+        self.assertEqual(disabled, 2)
+        self.assertTrue(records[0].is_enabled)
+        self.assertFalse(records[1].is_enabled)
+        self.assertFalse(records[2].is_enabled)
+        self.assertFalse(records[1].is_visible)
+        self.assertFalse(records[2].is_visible)
+        self.assertEqual(len(records), 3)
 
 
 if __name__ == "__main__":

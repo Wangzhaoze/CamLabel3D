@@ -20,32 +20,99 @@ class WorkflowStage(str, Enum):
 
 
 @dataclass(frozen=True)
-class FilterConfig:
-    """Global filter thresholds applied during postprocessing."""
+class BBoxFilterFieldOption:
+    """UI-friendly metadata for one numeric DetectionRecord field."""
 
+    field_name: str
+    label: str
+    minimum: float
+    maximum: float
+    step: float
+    decimals: int = 3
+
+
+BBOX_FILTER_FIELD_OPTIONS: tuple[BBoxFilterFieldOption, ...] = (
+    BBoxFilterFieldOption("score", "Score", 0.0, 1.0, 0.01, 3),
+    BBoxFilterFieldOption("score_2d", "2D Score", 0.0, 1.0, 0.01, 3),
+    BBoxFilterFieldOption("score_3d", "3D Score", 0.0, 1.0, 0.01, 3),
+    BBoxFilterFieldOption("box2d_x1", "box2d_x1", -100000.0, 100000.0, 1.0, 3),
+    BBoxFilterFieldOption("box2d_y1", "box2d_y1", -100000.0, 100000.0, 1.0, 3),
+    BBoxFilterFieldOption("box2d_x2", "box2d_x2", -100000.0, 100000.0, 1.0, 3),
+    BBoxFilterFieldOption("box2d_y2", "box2d_y2", -100000.0, 100000.0, 1.0, 3),
+    BBoxFilterFieldOption("center_x", "center_x", -100000.0, 100000.0, 0.5, 3),
+    BBoxFilterFieldOption("center_y", "center_y", -100000.0, 100000.0, 0.5, 3),
+    BBoxFilterFieldOption("center_z", "center_z", -100000.0, 100000.0, 0.5, 3),
+    BBoxFilterFieldOption("yaw_deg", "yaw_deg", -360.0, 360.0, 1.0, 2),
+    BBoxFilterFieldOption("pitch_deg", "pitch_deg", -360.0, 360.0, 1.0, 2),
+    BBoxFilterFieldOption("roll_deg", "roll_deg", -360.0, 360.0, 1.0, 2),
+    BBoxFilterFieldOption("size_w", "size_w", 0.0, 100000.0, 0.1, 3),
+    BBoxFilterFieldOption("size_l", "size_l", 0.0, 100000.0, 0.1, 3),
+    BBoxFilterFieldOption("size_h", "size_h", 0.0, 100000.0, 0.1, 3),
+)
+BBOX_FILTER_FIELD_OPTION_BY_NAME = {option.field_name: option for option in BBOX_FILTER_FIELD_OPTIONS}
+
+
+@dataclass(frozen=True)
+class BBoxFilterRule:
+    """One numeric row-level filter rule over DetectionRecord values."""
+
+    field_name: str
+    rule_enabled: bool = True
+    min_enabled: bool = False
+    min_value: float = 0.0
+    max_enabled: bool = False
+    max_value: float = 0.0
+
+    def has_active_bound(self) -> bool:
+        return bool(self.rule_enabled) and (bool(self.min_enabled) or bool(self.max_enabled))
+
+    def matches(self, record: DetectionRecord) -> bool:
+        if not self.has_active_bound():
+            return True
+        field_name = str(self.field_name or "").strip()
+        if field_name not in BBOX_FILTER_FIELD_OPTION_BY_NAME:
+            return True
+        value = float(getattr(record, field_name))
+        if self.min_enabled and value < float(self.min_value):
+            return False
+        if self.max_enabled and value > float(self.max_value):
+            return False
+        return True
+
+
+@dataclass(frozen=True)
+class FilterConfig:
+    """Global filter rules applied during postprocessing."""
+
+    rules: tuple[BBoxFilterRule, ...] = ()
+
+    # Legacy fixed thresholds are kept for compatibility with tests and CLI-like
+    # callers while the UI migrates to generic rule rows.
     min_score: float = 0.0
     min_score_3d: float = 0.0
     max_center_z: float = 0.0
     max_range_xz: float = 0.0
 
+    def normalized_rules(self) -> tuple[BBoxFilterRule, ...]:
+        rules = [rule for rule in self.rules if isinstance(rule, BBoxFilterRule)]
+        if float(self.min_score) > 0.0:
+            rules.append(BBoxFilterRule("score", min_enabled=True, min_value=float(self.min_score)))
+        if float(self.min_score_3d) > 0.0:
+            rules.append(BBoxFilterRule("score_3d", min_enabled=True, min_value=float(self.min_score_3d)))
+        if float(self.max_center_z) > 0.0:
+            rules.append(BBoxFilterRule("center_z", max_enabled=True, max_value=float(self.max_center_z)))
+        return tuple(rules)
+
     def has_active_threshold(self) -> bool:
-        return any(
-            value > 0.0
-            for value in (
-                float(self.min_score),
-                float(self.min_score_3d),
-                float(self.max_center_z),
-                float(self.max_range_xz),
-            )
+        return bool(
+            any(rule.has_active_bound() for rule in self.normalized_rules())
+            or float(self.max_range_xz) > 0.0
         )
 
     def matches(self, record: DetectionRecord) -> bool:
-        if float(self.min_score) > 0.0 and record.score < float(self.min_score):
-            return False
-        if float(self.min_score_3d) > 0.0 and record.score_3d < float(self.min_score_3d):
-            return False
-        if float(self.max_center_z) > 0.0 and record.center_z > float(self.max_center_z):
-            return False
+        for rule in self.normalized_rules():
+            if not rule.matches(record):
+                return False
         if float(self.max_range_xz) > 0.0:
             range_xz = (record.center_x ** 2 + record.center_z ** 2) ** 0.5
             if range_xz > float(self.max_range_xz):
