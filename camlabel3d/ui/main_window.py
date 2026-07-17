@@ -40,6 +40,8 @@ from PySide6.QtWidgets import (
 
 from camlabel3d.application import ApplicationContext, LoadedSource, OutlierIndex, RecordIndex
 from camlabel3d.core import (
+    BBOX_FILTER_FIELD_OPTIONS,
+    BBoxFilterRule,
     BulkOperationRegistry,
     DatasetSourcesConfig,
     DetectionConfig,
@@ -52,15 +54,17 @@ from camlabel3d.core import (
     ParameterSpec,
     PointPrompt,
     ProcessingContext,
-    ProcessingScope,
     PromptMode,
     PromptSpec,
     SourceContext,
     SourceMode,
     TrackSummary,
     TrackBatchEditRequest,
+    TemplateOutlierRule,
     TrackingConfig,
     VideoFrameProvider,
+    WARNING_METRIC_SPECS,
+    WarningRuleTemplate,
     WorkflowStage,
     apply_track_batch_edit,
     build_bev_scene,
@@ -109,7 +113,7 @@ RESULTS_TABLE_COLUMNS: list[tuple[str, str, str, bool]] = [
 ]
 
 TRACK_TABLE_COLUMNS = ("track_id", "category", "enabled_count", "first_frame", "last_frame", "status")
-OUTLIER_TABLE_COLUMNS = ("frame_index", "track_id", "category", "rule_id", "severity", "fixable", "message")
+OUTLIER_TABLE_COLUMNS = ("frame_index", "track_id", "category", "rule_id", "severity", "message")
 
 GEOMETRY_RESULT_FIELDS = {
     "center_x",
@@ -123,17 +127,28 @@ GEOMETRY_RESULT_FIELDS = {
     "size_h",
 }
 
-OUTLIER_RULE_COLORS: dict[str, QColor] = {
-    "yaw_spike": QColor(232, 88, 88),
-    "pitch_spike": QColor(245, 166, 35),
-    "roll_spike": QColor(170, 108, 255),
-    "size_spike": QColor(64, 156, 255),
-    "center_spike": QColor(74, 201, 126),
+WARNING_METRIC_COLORS: dict[str, QColor] = {
+    "yaw_deg": QColor(232, 88, 88),
+    "pitch_deg": QColor(245, 166, 35),
+    "roll_deg": QColor(170, 108, 255),
+    "size": QColor(64, 156, 255),
+    "size_w": QColor(64, 156, 255),
+    "size_l": QColor(64, 156, 255),
+    "size_h": QColor(64, 156, 255),
+    "center": QColor(74, 201, 126),
+    "center_x": QColor(74, 201, 126),
+    "center_y": QColor(74, 201, 126),
+    "center_z": QColor(74, 201, 126),
+    "score": QColor(255, 184, 77),
+    "score_2d": QColor(255, 184, 77),
+    "score_3d": QColor(255, 184, 77),
 }
 class ActivitySection(str, Enum):
     FILE = "File"
     DETECT = "Detect"
+    POSTPROCESS = "Postprocess"
     TRACK = "Track"
+    WARNING = "Warning"
 
 
 class PreviewMode(str, Enum):
@@ -197,9 +212,11 @@ class MainWindow(QMainWindow):
         self._io_task_failure_title = "Background Task Failed"
         self._controls_locked = False
         self._results_table_internal_change = False
+        self._filter_rule_table_internal_change = False
         self._outlier_rule_table_internal_change = False
         self._source_ui_guard = False
         self.current_track_ids: list[str] = []
+        self.filter_rules: list[BBoxFilterRule] = [BBoxFilterRule(field_name="score")]
         self.outlier_hits_global: list[OutlierHit] = []
         self.outlier_hits_visible: list[OutlierHit] = []
         self.outlier_hits_by_det_id: dict[str, list[OutlierHit]] = {}
@@ -221,8 +238,10 @@ class MainWindow(QMainWindow):
             operation.operation_id: operation.default_params()
             for operation in self.bulk_operation_registry.all()
         }
+        self._filter_field_widgets: dict[str, QWidget] = {}
         self._outlier_param_widgets: dict[str, QWidget] = {}
         self._bulk_param_widgets: dict[str, QWidget] = {}
+        self._warning_rule_serial = 0
         self.activity_section = ActivitySection.FILE
         self._activity_buttons: dict[ActivitySection, QToolButton] = {}
         self._activity_page_indices: dict[ActivitySection, int] = {}
@@ -366,6 +385,7 @@ class MainWindow(QMainWindow):
         self.detection_params_group = self._build_detection_group(self.side_panel_container)
         self.run_group = self._build_run_group(self.side_panel_container)
         self.postprocess_group = self._build_postprocess_group(self.side_panel_container)
+        self.tracking_group = self._build_tracking_group(self.side_panel_container)
         self.outlier_group = self._build_outlier_group(self.side_panel_container)
         self.bulk_ops_group = self._build_bulk_ops_group(self.side_panel_container)
         self.track_group = self._build_track_group(self.side_panel_container)
@@ -418,7 +438,9 @@ class MainWindow(QMainWindow):
         icons = {
             ActivitySection.FILE: self.style().standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon),
             ActivitySection.DETECT: self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay),
+            ActivitySection.POSTPROCESS: self.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton),
             ActivitySection.TRACK: self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView),
+            ActivitySection.WARNING: self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning),
         }
         for section in ActivitySection:
             button = QToolButton(widget)
@@ -448,7 +470,9 @@ class MainWindow(QMainWindow):
         pages = {
             ActivitySection.FILE: [self.source_group],
             ActivitySection.DETECT: [self.prompt_group, self.detection_params_group, self.run_group],
-            ActivitySection.TRACK: [self.postprocess_group, self.outlier_group, self.bulk_ops_group, self.track_group],
+            ActivitySection.POSTPROCESS: [self.postprocess_group],
+            ActivitySection.TRACK: [self.tracking_group, self.bulk_ops_group, self.track_group],
+            ActivitySection.WARNING: [self.outlier_group],
         }
         for section, groups in pages.items():
             page = self._build_side_panel_page(groups, title=section.value)
@@ -717,45 +741,129 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.stage_label)
 
         self.start_postprocess_btn = QPushButton("Start Postprocessing", group)
-        self.run_tracking_btn = QPushButton("Run Tracking", group)
-        layout.addWidget(self._row_widget(self.start_postprocess_btn, self.run_tracking_btn))
+        layout.addWidget(self.start_postprocess_btn)
 
         self.undo_change_btn = QPushButton("Undo Last Change", group)
         self.save_latest_btn = QPushButton("Save Latest", group)
         self.reset_to_raw_btn = QPushButton("Reset to Raw", group)
         layout.addWidget(self._row_widget(self.undo_change_btn, self.save_latest_btn, self.reset_to_raw_btn))
 
-        filter_form = QFormLayout()
-        self.filter_min_score_spin = self._make_float_spinbox(0.0, 0.0, 1.0, 0.01, 3)
-        self.filter_min_score_3d_spin = self._make_float_spinbox(0.0, 0.0, 1.0, 0.01, 3)
-        self.filter_max_center_z_spin = self._make_float_spinbox(0.0, 0.0, 100000.0, 0.5, 3)
-        self.filter_max_range_xz_spin = self._make_float_spinbox(0.0, 0.0, 100000.0, 0.5, 3)
-        filter_form.addRow("Min Score", self.filter_min_score_spin)
-        filter_form.addRow("Min 3D Score", self.filter_min_score_3d_spin)
-        filter_form.addRow("Max center_z", self.filter_max_center_z_spin)
-        filter_form.addRow("Max range_xz", self.filter_max_range_xz_spin)
-        layout.addLayout(filter_form)
+        self.filter_rule_table = QTableWidget(group)
+        self.filter_rule_table.setColumnCount(3)
+        self.filter_rule_table.setHorizontalHeaderLabels(["Enabled", "Field", "Bounds"])
+        self.filter_rule_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.filter_rule_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.filter_rule_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked
+            | QAbstractItemView.EditTrigger.SelectedClicked
+            | QAbstractItemView.EditTrigger.EditKeyPressed
+        )
+        self.filter_rule_table.verticalHeader().setVisible(False)
+        filter_header = self.filter_rule_table.horizontalHeader()
+        filter_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        filter_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        filter_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.filter_rule_table)
 
-        scope_form = QFormLayout()
-        self.processing_scope_combo = MenuWheelComboBox(group)
-        for scope in ProcessingScope:
-            self.processing_scope_combo.addItem(scope.value, scope.value)
-        scope_form.addRow("Scope", self.processing_scope_combo)
-        layout.addLayout(scope_form)
+        filter_buttons = QWidget(group)
+        filter_buttons_layout = QHBoxLayout(filter_buttons)
+        filter_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        filter_buttons_layout.setSpacing(6)
+        self.add_filter_rule_btn = QPushButton("Add Rule", filter_buttons)
+        self.remove_filter_rule_btn = QPushButton("Remove Rule", filter_buttons)
+        filter_buttons_layout.addWidget(self.add_filter_rule_btn)
+        filter_buttons_layout.addWidget(self.remove_filter_rule_btn)
+        filter_buttons_layout.addStretch(1)
+        layout.addWidget(filter_buttons)
 
-        self.apply_filter_btn = QPushButton("Apply Filter", group)
+        filter_editor_form = QFormLayout()
+        self.filter_field_combo = MenuWheelComboBox(group)
+        for option in BBOX_FILTER_FIELD_OPTIONS:
+            self.filter_field_combo.addItem(option.label, option.field_name)
+        filter_editor_form.addRow("Field", self.filter_field_combo)
+
+        self.filter_min_enabled_checkbox = QCheckBox("Enable Min", group)
+        self.filter_min_value_spin = self._make_float_spinbox(-100000.0, -100000.0, 100000.0, 0.1, 3)
+        filter_editor_form.addRow(self.filter_min_enabled_checkbox, self.filter_min_value_spin)
+
+        self.filter_max_enabled_checkbox = QCheckBox("Enable Max", group)
+        self.filter_max_value_spin = self._make_float_spinbox(-100000.0, -100000.0, 100000.0, 0.1, 3)
+        filter_editor_form.addRow(self.filter_max_enabled_checkbox, self.filter_max_value_spin)
+        layout.addLayout(filter_editor_form)
+
+        self.filter_hint_label = QLabel(
+            "All enabled rules are combined with AND semantics. Applying filters only disables rows; it never deletes them.",
+            group,
+        )
+        self.filter_hint_label.setWordWrap(True)
+        layout.addWidget(self.filter_hint_label)
+
+        self.apply_filter_btn = QPushButton("Apply Filters", group)
         layout.addWidget(self.apply_filter_btn)
         return group
 
+    def _build_tracking_group(self, parent: QWidget) -> QGroupBox:
+        group = QGroupBox("Tracking", parent)
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(8, 10, 8, 8)
+        layout.setSpacing(6)
+
+        form = QFormLayout()
+        self.tracking_max_gap_frames_spin = NoWheelSpinBox(group)
+        self.tracking_max_gap_frames_spin.setRange(0, 100000)
+        self.tracking_max_gap_frames_spin.setValue(TrackingConfig.max_gap_frames)
+        form.addRow("max_gap_frames", self.tracking_max_gap_frames_spin)
+
+        self.tracking_max_center_distance_spin = self._make_float_spinbox(
+            TrackingConfig.max_center_distance_m,
+            0.0,
+            100000.0,
+            0.1,
+            3,
+        )
+        form.addRow("max_center_distance_m", self.tracking_max_center_distance_spin)
+
+        self.tracking_min_2d_iou_spin = self._make_float_spinbox(
+            TrackingConfig.min_2d_iou,
+            0.0,
+            1.0,
+            0.01,
+            3,
+        )
+        form.addRow("min_2d_iou", self.tracking_min_2d_iou_spin)
+
+        self.tracking_min_3d_iou_spin = self._make_float_spinbox(
+            TrackingConfig.min_3d_iou,
+            0.0,
+            1.0,
+            0.01,
+            3,
+        )
+        form.addRow("min_3d_iou", self.tracking_min_3d_iou_spin)
+
+        self.tracking_previous_id_bonus_spin = self._make_float_spinbox(
+            TrackingConfig.previous_id_bonus,
+            0.0,
+            10.0,
+            0.01,
+            3,
+        )
+        form.addRow("previous_id_bonus", self.tracking_previous_id_bonus_spin)
+        layout.addLayout(form)
+
+        self.run_tracking_btn = QPushButton("Run Tracking", group)
+        layout.addWidget(self.run_tracking_btn)
+        return group
+
     def _build_outlier_group(self, parent: QWidget) -> QGroupBox:
-        group = QGroupBox("Outlier Manager", parent)
+        group = QGroupBox("Warning Analysis", parent)
         layout = QVBoxLayout(group)
         layout.setContentsMargins(8, 10, 8, 8)
         layout.setSpacing(6)
 
         self.outlier_rule_table = QTableWidget(group)
-        self.outlier_rule_table.setColumnCount(3)
-        self.outlier_rule_table.setHorizontalHeaderLabels(["Enabled", "Rule", "Hits"])
+        self.outlier_rule_table.setColumnCount(4)
+        self.outlier_rule_table.setHorizontalHeaderLabels(["Enabled", "Rule", "Metric", "Hits"])
         self.outlier_rule_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.outlier_rule_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.outlier_rule_table.setEditTriggers(
@@ -768,20 +876,43 @@ class MainWindow(QMainWindow):
         outlier_rule_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         outlier_rule_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         outlier_rule_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        outlier_rule_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(self.outlier_rule_table)
+
+        warning_rule_buttons = QWidget(group)
+        warning_rule_buttons_layout = QHBoxLayout(warning_rule_buttons)
+        warning_rule_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        warning_rule_buttons_layout.setSpacing(6)
+        self.add_warning_rule_btn = QPushButton("Add Rule", warning_rule_buttons)
+        self.remove_warning_rule_btn = QPushButton("Remove Rule", warning_rule_buttons)
+        self.refresh_outliers_btn = QPushButton("Refresh Warnings", warning_rule_buttons)
+        warning_rule_buttons_layout.addWidget(self.add_warning_rule_btn)
+        warning_rule_buttons_layout.addWidget(self.remove_warning_rule_btn)
+        warning_rule_buttons_layout.addWidget(self.refresh_outliers_btn)
+        layout.addWidget(warning_rule_buttons)
+
+        warning_editor_form = QFormLayout()
+        self.warning_template_combo = MenuWheelComboBox(group)
+        for template in WarningRuleTemplate:
+            self.warning_template_combo.addItem(template.value.title(), template.value)
+        warning_editor_form.addRow("Template", self.warning_template_combo)
+
+        self.warning_metric_combo = MenuWheelComboBox(group)
+        for metric in WARNING_METRIC_SPECS:
+            self.warning_metric_combo.addItem(metric.label, metric.metric_id)
+        warning_editor_form.addRow("Metric", self.warning_metric_combo)
+        layout.addLayout(warning_editor_form)
 
         self.outlier_param_form = QFormLayout()
         layout.addLayout(self.outlier_param_form)
 
-        self.refresh_outliers_btn = QPushButton("Refresh Outliers", group)
-        self.fix_selected_outlier_btn = QPushButton("Fix Selected", group)
-        self.fix_scope_outliers_btn = QPushButton("Fix Current Scope", group)
-        self.fix_all_visible_outliers_btn = QPushButton("Fix All Visible", group)
-        layout.addWidget(self._row_widget(self.refresh_outliers_btn, self.fix_selected_outlier_btn))
-        layout.addWidget(self._row_widget(self.fix_scope_outliers_btn, self.fix_all_visible_outliers_btn))
+        self.warning_selected_rule_filter_checkbox = QCheckBox("Filter Hits To Selected Rule", group)
+        self.warning_selected_track_filter_checkbox = QCheckBox("Filter Hits To Selected Track", group)
+        layout.addWidget(self.warning_selected_rule_filter_checkbox)
+        layout.addWidget(self.warning_selected_track_filter_checkbox)
 
         self.outlier_hint_label = QLabel(
-            "Rules are off by default. Enable the rules you want, then click Refresh Outliers to run them.",
+            "Warning rules are reusable global definitions. Refresh evaluates all enabled rules without mutating the CSV.",
             group,
         )
         self.outlier_hint_label.setWordWrap(True)
@@ -789,7 +920,7 @@ class MainWindow(QMainWindow):
 
         self.outlier_table = QTableWidget(group)
         self.outlier_table.setColumnCount(len(OUTLIER_TABLE_COLUMNS))
-        self.outlier_table.setHorizontalHeaderLabels(["Frame", "Track", "Category", "Rule", "Severity", "Fix", "Message"])
+        self.outlier_table.setHorizontalHeaderLabels(["Frame", "Track", "Category", "Rule", "Severity", "Message"])
         self.outlier_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.outlier_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.outlier_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -802,7 +933,7 @@ class MainWindow(QMainWindow):
         return group
 
     def _build_bulk_ops_group(self, parent: QWidget) -> QGroupBox:
-        group = QGroupBox("Bulk Operations", parent)
+        group = QGroupBox("Track Batch Operations", parent)
         layout = QVBoxLayout(group)
         layout.setContentsMargins(8, 10, 8, 8)
         layout.setSpacing(6)
@@ -815,12 +946,19 @@ class MainWindow(QMainWindow):
         self.bulk_param_form = QFormLayout()
         layout.addLayout(self.bulk_param_form)
 
-        self.apply_bulk_operation_btn = QPushButton("Apply To Scope", group)
+        self.bulk_hint_label = QLabel(
+            "These helpers operate only on the currently selected track. For spreadsheet-style edits, use the track batch editor below.",
+            group,
+        )
+        self.bulk_hint_label.setWordWrap(True)
+        layout.addWidget(self.bulk_hint_label)
+
+        self.apply_bulk_operation_btn = QPushButton("Apply To Selected Track", group)
         layout.addWidget(self.apply_bulk_operation_btn)
         return group
 
     def _build_track_group(self, parent: QWidget) -> QGroupBox:
-        group = QGroupBox("Track Manager", parent)
+        group = QGroupBox("Track Summary", parent)
         layout = QVBoxLayout(group)
         layout.setContentsMargins(8, 10, 8, 8)
         layout.setSpacing(6)
@@ -840,7 +978,7 @@ class MainWindow(QMainWindow):
             track_header.setSectionResizeMode(index, mode)
         layout.addWidget(self.track_table)
 
-        self.delete_track_btn = QPushButton("Delete Track", group)
+        self.delete_track_btn = QPushButton("Disable Track", group)
         self.lock_track_btn = QPushButton("Lock Track", group)
         self.unlock_track_btn = QPushButton("Unlock Track", group)
         layout.addWidget(self._row_widget(self.delete_track_btn, self.lock_track_btn, self.unlock_track_btn))
@@ -861,7 +999,7 @@ class MainWindow(QMainWindow):
         return group
 
     def _build_results_group(self, parent: QWidget) -> QGroupBox:
-        group = QGroupBox("Current Frame Results", parent)
+        group = QGroupBox("Current Frame BBoxes", parent)
         layout = QVBoxLayout(group)
         layout.setContentsMargins(8, 10, 8, 8)
         layout.setSpacing(6)
@@ -947,14 +1085,25 @@ class MainWindow(QMainWindow):
         self.save_latest_btn.clicked.connect(self._save_latest_now)
         self.reset_to_raw_btn.clicked.connect(self._reset_to_raw)
         self.apply_filter_btn.clicked.connect(self._apply_filter)
-        self.processing_scope_combo.currentIndexChanged.connect(self._on_processing_scope_changed)
+        self.filter_rule_table.currentCellChanged.connect(self._on_filter_rule_selection_changed)
+        self.filter_rule_table.itemChanged.connect(self._on_filter_rule_item_changed)
+        self.add_filter_rule_btn.clicked.connect(self._add_filter_rule)
+        self.remove_filter_rule_btn.clicked.connect(self._remove_selected_filter_rule)
+        self.filter_field_combo.currentIndexChanged.connect(self._on_filter_rule_editor_changed)
+        self.filter_min_enabled_checkbox.toggled.connect(self._on_filter_rule_editor_changed)
+        self.filter_min_value_spin.valueChanged.connect(self._on_filter_rule_editor_changed)
+        self.filter_max_enabled_checkbox.toggled.connect(self._on_filter_rule_editor_changed)
+        self.filter_max_value_spin.valueChanged.connect(self._on_filter_rule_editor_changed)
 
         self.outlier_rule_table.currentCellChanged.connect(self._on_outlier_rule_selection_changed)
         self.outlier_rule_table.itemChanged.connect(self._on_outlier_rule_item_changed)
         self.refresh_outliers_btn.clicked.connect(self._refresh_outlier_analysis_requested)
-        self.fix_selected_outlier_btn.clicked.connect(self._fix_selected_outlier)
-        self.fix_scope_outliers_btn.clicked.connect(self._fix_current_scope_outliers)
-        self.fix_all_visible_outliers_btn.clicked.connect(self._fix_all_visible_outliers)
+        self.add_warning_rule_btn.clicked.connect(self._add_warning_rule)
+        self.remove_warning_rule_btn.clicked.connect(self._remove_selected_warning_rule)
+        self.warning_template_combo.currentIndexChanged.connect(self._on_warning_rule_definition_changed)
+        self.warning_metric_combo.currentIndexChanged.connect(self._on_warning_rule_definition_changed)
+        self.warning_selected_rule_filter_checkbox.toggled.connect(self._on_warning_hit_filter_changed)
+        self.warning_selected_track_filter_checkbox.toggled.connect(self._on_warning_hit_filter_changed)
         self.outlier_table.currentCellChanged.connect(self._on_outlier_selection_changed)
 
         self.bulk_operation_combo.currentIndexChanged.connect(self._on_bulk_operation_changed)
@@ -974,6 +1123,13 @@ class MainWindow(QMainWindow):
     def _initialize_processing_controls(self) -> None:
         for operation in self.bulk_operation_registry.all():
             self.bulk_operation_combo.addItem(operation.display_name, operation.operation_id)
+        self._warning_rule_serial = max(
+            len(self.outlier_registry.all()),
+            len(self.outlier_rule_params),
+            len(self.outlier_rule_enabled),
+        )
+        self._refresh_filter_rule_table()
+        self._load_selected_filter_rule_editor()
         self._refresh_outlier_rule_table()
         self._load_selected_outlier_rule_editor()
         self._load_selected_bulk_operation_editor()
@@ -987,10 +1143,6 @@ class MainWindow(QMainWindow):
     def current_prompt_mode(self) -> PromptMode:
         value = self.prompt_mode_combo.currentData() or self.prompt_mode_combo.currentText()
         return PromptMode(value)
-
-    def _selected_processing_scope(self) -> ProcessingScope:
-        value = self.processing_scope_combo.currentData() or self.processing_scope_combo.currentText()
-        return ProcessingScope(value)
 
     def _selected_outlier_rule_id(self) -> str | None:
         row = self.outlier_rule_table.currentRow()
@@ -1061,10 +1213,25 @@ class MainWindow(QMainWindow):
     def _load_selected_outlier_rule_editor(self) -> None:
         rule_id = self._selected_outlier_rule_id()
         if not rule_id:
+            with QSignalBlocker(self.warning_template_combo), QSignalBlocker(self.warning_metric_combo):
+                if self.warning_template_combo.count():
+                    self.warning_template_combo.setCurrentIndex(0)
+                if self.warning_metric_combo.count():
+                    self.warning_metric_combo.setCurrentIndex(0)
             self._clear_form_layout(self.outlier_param_form)
             self._outlier_param_widgets.clear()
             return
         rule = self.outlier_registry.get(rule_id)
+        if isinstance(rule, TemplateOutlierRule):
+            template_index = self.warning_template_combo.findData(rule.rule_template.value)
+            if template_index < 0:
+                template_index = 0
+            metric_index = self.warning_metric_combo.findData(rule.target_metric)
+            if metric_index < 0:
+                metric_index = 0
+            with QSignalBlocker(self.warning_template_combo), QSignalBlocker(self.warning_metric_combo):
+                self.warning_template_combo.setCurrentIndex(template_index)
+                self.warning_metric_combo.setCurrentIndex(metric_index)
         values = self.outlier_rule_params.setdefault(rule_id, rule.default_params())
         self._populate_param_form(self.outlier_param_form, rule.param_specs, values, self._outlier_param_widgets)
 
@@ -1077,6 +1244,145 @@ class MainWindow(QMainWindow):
         operation = self.bulk_operation_registry.get(operation_id)
         values = self.bulk_operation_params.setdefault(operation_id, operation.default_params())
         self._populate_param_form(self.bulk_param_form, operation.param_specs, values, self._bulk_param_widgets)
+
+    def _selected_filter_rule_index(self) -> int | None:
+        row = self.filter_rule_table.currentRow()
+        if 0 <= row < len(self.filter_rules):
+            return row
+        return None
+
+    def _selected_filter_rule(self) -> BBoxFilterRule | None:
+        index = self._selected_filter_rule_index()
+        if index is None:
+            return None
+        return self.filter_rules[index]
+
+    @staticmethod
+    def _filter_rule_field_label(field_name: str) -> str:
+        option = next((item for item in BBOX_FILTER_FIELD_OPTIONS if item.field_name == field_name), None)
+        return option.label if option is not None else str(field_name or "")
+
+    def _filter_rule_bounds_summary(self, rule: BBoxFilterRule) -> str:
+        parts: list[str] = []
+        if rule.min_enabled:
+            parts.append(f">= {float(rule.min_value):.3f}")
+        if rule.max_enabled:
+            parts.append(f"<= {float(rule.max_value):.3f}")
+        return " and ".join(parts) if parts else "No bounds"
+
+    def _configure_filter_value_spins(self, field_name: str, *, current_rule: BBoxFilterRule | None = None) -> None:
+        option = next((item for item in BBOX_FILTER_FIELD_OPTIONS if item.field_name == field_name), None)
+        if option is None:
+            option = BBOX_FILTER_FIELD_OPTIONS[0]
+        for widget in (self.filter_min_value_spin, self.filter_max_value_spin):
+            widget.setDecimals(int(option.decimals))
+            widget.setRange(float(option.minimum), float(option.maximum))
+            widget.setSingleStep(float(option.step))
+        if current_rule is not None:
+            with QSignalBlocker(self.filter_min_value_spin), QSignalBlocker(self.filter_max_value_spin):
+                self.filter_min_value_spin.setValue(float(current_rule.min_value))
+                self.filter_max_value_spin.setValue(float(current_rule.max_value))
+
+    def _set_filter_rule_editor_enabled(self, enabled: bool) -> None:
+        self.filter_field_combo.setEnabled(enabled)
+        self.filter_min_enabled_checkbox.setEnabled(enabled)
+        self.filter_max_enabled_checkbox.setEnabled(enabled)
+        self.filter_min_value_spin.setEnabled(enabled and self.filter_min_enabled_checkbox.isChecked())
+        self.filter_max_value_spin.setEnabled(enabled and self.filter_max_enabled_checkbox.isChecked())
+
+    def _refresh_filter_rule_table(self, preserve_index: int | None = None) -> None:
+        selected_index = preserve_index if preserve_index is not None else self._selected_filter_rule_index()
+        self._filter_rule_table_internal_change = True
+        with QSignalBlocker(self.filter_rule_table):
+            self.filter_rule_table.setRowCount(len(self.filter_rules))
+            for row_index, rule in enumerate(self.filter_rules):
+                enabled_item = QTableWidgetItem()
+                enabled_item.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsUserCheckable
+                )
+                enabled_item.setCheckState(Qt.CheckState.Checked if rule.rule_enabled else Qt.CheckState.Unchecked)
+                self.filter_rule_table.setItem(row_index, 0, enabled_item)
+
+                field_item = QTableWidgetItem(self._filter_rule_field_label(rule.field_name))
+                field_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                self.filter_rule_table.setItem(row_index, 1, field_item)
+
+                bounds_item = QTableWidgetItem(self._filter_rule_bounds_summary(rule))
+                bounds_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                self.filter_rule_table.setItem(row_index, 2, bounds_item)
+
+            if not self.filter_rules:
+                self.filter_rule_table.clearSelection()
+            else:
+                target_row = 0 if selected_index is None else min(max(int(selected_index), 0), len(self.filter_rules) - 1)
+                self.filter_rule_table.setCurrentCell(target_row, 1)
+        self._filter_rule_table_internal_change = False
+
+    def _load_selected_filter_rule_editor(self) -> None:
+        rule = self._selected_filter_rule()
+        if rule is None:
+            self._set_filter_rule_editor_enabled(False)
+            return
+        field_index = self.filter_field_combo.findData(rule.field_name)
+        if field_index < 0:
+            field_index = 0
+        self._configure_filter_value_spins(rule.field_name, current_rule=rule)
+        with (
+            QSignalBlocker(self.filter_field_combo),
+            QSignalBlocker(self.filter_min_enabled_checkbox),
+            QSignalBlocker(self.filter_min_value_spin),
+            QSignalBlocker(self.filter_max_enabled_checkbox),
+            QSignalBlocker(self.filter_max_value_spin),
+        ):
+            self.filter_field_combo.setCurrentIndex(field_index)
+            self.filter_min_enabled_checkbox.setChecked(bool(rule.min_enabled))
+            self.filter_min_value_spin.setValue(float(rule.min_value))
+            self.filter_max_enabled_checkbox.setChecked(bool(rule.max_enabled))
+            self.filter_max_value_spin.setValue(float(rule.max_value))
+        self._set_filter_rule_editor_enabled(True)
+
+    def _commit_selected_filter_rule_from_editor(self) -> None:
+        index = self._selected_filter_rule_index()
+        if index is None:
+            self._set_filter_rule_editor_enabled(False)
+            return
+        field_name = str(self.filter_field_combo.currentData() or self.filter_field_combo.currentText() or "score").strip()
+        current_rule = self.filter_rules[index]
+        self._configure_filter_value_spins(field_name)
+        updated_rule = BBoxFilterRule(
+            field_name=field_name,
+            rule_enabled=current_rule.rule_enabled,
+            min_enabled=self.filter_min_enabled_checkbox.isChecked(),
+            min_value=float(self.filter_min_value_spin.value()),
+            max_enabled=self.filter_max_enabled_checkbox.isChecked(),
+            max_value=float(self.filter_max_value_spin.value()),
+        )
+        self.filter_rules[index] = updated_rule
+        self._set_filter_rule_editor_enabled(True)
+        self._refresh_filter_rule_table(preserve_index=index)
+
+    def _add_filter_rule(self) -> None:
+        self.filter_rules.append(BBoxFilterRule(field_name="score"))
+        self._refresh_filter_rule_table(preserve_index=len(self.filter_rules) - 1)
+        self._load_selected_filter_rule_editor()
+        self._update_action_states()
+
+    def _remove_selected_filter_rule(self) -> None:
+        index = self._selected_filter_rule_index()
+        if index is None:
+            self._show_warning("No Filter Rule Selected", "Select one filter rule first.")
+            return
+        if len(self.filter_rules) <= 1:
+            self.filter_rules = [BBoxFilterRule(field_name="score")]
+            preserve_index = 0
+        else:
+            del self.filter_rules[index]
+            preserve_index = min(index, len(self.filter_rules) - 1)
+        self._refresh_filter_rule_table(preserve_index=preserve_index)
+        self._load_selected_filter_rule_editor()
+        self._update_action_states()
 
     def _refresh_outlier_rule_table(self, preserve_rule_id: str | None = None) -> None:
         selected_rule_id = preserve_rule_id or self._selected_outlier_rule_id()
@@ -1111,11 +1417,20 @@ class MainWindow(QMainWindow):
                     name_item.setBackground(background_color)
                 self.outlier_rule_table.setItem(row_index, 1, name_item)
 
+                metric_label = "-"
+                if isinstance(rule, TemplateOutlierRule):
+                    metric_label = rule.metric_spec.label
+                metric_item = QTableWidgetItem(metric_label)
+                metric_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                if background_color is not None:
+                    metric_item.setBackground(background_color)
+                self.outlier_rule_table.setItem(row_index, 2, metric_item)
+
                 count_item = QTableWidgetItem(str(hit_counts.get(rule.rule_id, 0)))
                 count_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
                 if background_color is not None:
                     count_item.setBackground(background_color)
-                self.outlier_rule_table.setItem(row_index, 2, count_item)
+                self.outlier_rule_table.setItem(row_index, 3, count_item)
 
             selected_row = 0 if rules else -1
             if selected_rule_id:
@@ -1147,24 +1462,25 @@ class MainWindow(QMainWindow):
         hit = self._selected_outlier_hit()
         return self._outlier_hit_key(hit) if hit is not None else None
 
-    def _scope_filtered_hits(self, scope: ProcessingScope | None = None, rule_id: str | None = None) -> list[OutlierHit]:
-        if not self.outlier_hits_global:
-            return []
-        resolved_scope = ProcessingScope(scope or self._selected_processing_scope())
-        if resolved_scope == ProcessingScope.CURRENT_FRAME:
-            hits = self.outlier_hits_by_frame.get(int(self.current_frame_index), [])
-        elif resolved_scope == ProcessingScope.SELECTED_TRACK:
-            selected_track_id = str(self._selected_track_id() or "").strip()
-            hits = self.outlier_hits_by_track_id.get(selected_track_id, []) if selected_track_id else []
-        else:
-            hits = self.outlier_hits_by_rule_id.get(rule_id, self.outlier_hits_global) if rule_id else self.outlier_hits_global
-        if rule_id is None or resolved_scope == ProcessingScope.GLOBAL:
-            return list(hits)
-        return [hit for hit in hits if hit.rule_id == rule_id]
+    def _filtered_warning_hits(self) -> list[OutlierHit]:
+        hits = list(self.outlier_hits_global)
+        if self.warning_selected_rule_filter_checkbox.isChecked():
+            rule_id = self._selected_outlier_rule_id()
+            if rule_id:
+                hits = [hit for hit in hits if hit.rule_id == rule_id]
+            else:
+                hits = []
+        if self.warning_selected_track_filter_checkbox.isChecked():
+            track_id = str(self._selected_track_id() or "").strip()
+            if track_id:
+                hits = [hit for hit in hits if str(hit.track_id).strip() == track_id]
+            else:
+                hits = []
+        return hits
 
     def _refresh_visible_outlier_table(self, preserve_key: str | None = None) -> None:
         selected_key = preserve_key or self._selected_outlier_key()
-        self.outlier_hits_visible = list(self.outlier_hits_global)
+        self.outlier_hits_visible = self._filtered_warning_hits()
         with QSignalBlocker(self.outlier_table):
             self.outlier_table.setRowCount(len(self.outlier_hits_visible))
             for row_index, hit in enumerate(self.outlier_hits_visible):
@@ -1174,7 +1490,6 @@ class MainWindow(QMainWindow):
                     hit.category,
                     hit.rule_id,
                     f"{float(hit.severity):.2f}",
-                    "Yes" if hit.fixable else "No",
                     hit.message,
                 )
                 background_color = self._outlier_background_for_rule(hit.rule_id)
@@ -1382,11 +1697,37 @@ class MainWindow(QMainWindow):
         self._set_running_state(False)
         self._refresh_info_panel()
 
-    def _on_processing_scope_changed(self) -> None:
+    def _on_filter_rule_selection_changed(self) -> None:
+        self._load_selected_filter_rule_editor()
+        self._update_action_states()
+
+    def _on_filter_rule_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._filter_rule_table_internal_change or item.column() != 0:
+            return
+        index = item.row()
+        if not (0 <= index < len(self.filter_rules)):
+            return
+        rule = self.filter_rules[index]
+        self.filter_rules[index] = BBoxFilterRule(
+            field_name=rule.field_name,
+            rule_enabled=item.checkState() == Qt.CheckState.Checked,
+            min_enabled=rule.min_enabled,
+            min_value=rule.min_value,
+            max_enabled=rule.max_enabled,
+            max_value=rule.max_value,
+        )
+        self._refresh_filter_rule_table(preserve_index=index)
+        self._load_selected_filter_rule_editor()
+        self._update_action_states()
+
+    def _on_filter_rule_editor_changed(self) -> None:
+        self._set_filter_rule_editor_enabled(self._selected_filter_rule() is not None)
+        self._commit_selected_filter_rule_from_editor()
         self._update_action_states()
 
     def _on_outlier_rule_selection_changed(self) -> None:
         self._load_selected_outlier_rule_editor()
+        self._refresh_visible_outlier_table()
         self._update_action_states()
 
     def _on_outlier_rule_item_changed(self, item: QTableWidgetItem) -> None:
@@ -1398,12 +1739,47 @@ class MainWindow(QMainWindow):
         self.outlier_rule_enabled[str(rule_id)] = item.checkState() == Qt.CheckState.Checked
         self._invalidate_outlier_analysis(
             show_status=True,
-            message="Outlier rule selection updated. Click Refresh Outliers to run the enabled rules.",
+            message="Warning rule selection updated. Click Refresh Warnings to run the enabled rules.",
         )
 
     def _on_bulk_operation_changed(self) -> None:
         self._load_selected_bulk_operation_editor()
         self._update_action_states()
+
+    def _on_warning_rule_definition_changed(self) -> None:
+        rule_id = self._selected_outlier_rule_id()
+        if not rule_id:
+            return
+        rule = self.outlier_registry.get(rule_id)
+        if not isinstance(rule, TemplateOutlierRule):
+            return
+        template_value = self.warning_template_combo.currentData() or self.warning_template_combo.currentText()
+        metric_value = self.warning_metric_combo.currentData() or self.warning_metric_combo.currentText()
+        rule.reconfigure(
+            rule_template=WarningRuleTemplate(str(template_value)),
+            target_metric=str(metric_value),
+        )
+        self.outlier_rule_params[rule_id] = rule.default_params()
+        self._refresh_outlier_rule_table(preserve_rule_id=rule_id)
+        self._load_selected_outlier_rule_editor()
+        self._refresh_visible_outlier_table()
+        self._invalidate_outlier_analysis(
+            show_status=True,
+            message="Warning rule definition updated. Click Refresh Warnings to evaluate the new configuration.",
+        )
+
+    def _on_warning_hit_filter_changed(self) -> None:
+        self._refresh_visible_outlier_table()
+        self._update_action_states()
+
+    def _next_warning_rule_id(self) -> str:
+        while True:
+            self._warning_rule_serial += 1
+            candidate = f"warning_rule_{self._warning_rule_serial}"
+            try:
+                self.outlier_registry.get(candidate)
+            except Exception:
+                return candidate
 
     def _on_outlier_selection_changed(self) -> None:
         hit = self._selected_outlier_hit()
@@ -1415,68 +1791,36 @@ class MainWindow(QMainWindow):
         self._refresh_table(preserve_det_id=hit.det_id)
         self._update_action_states()
 
-    def _fix_selected_outlier(self) -> None:
-        hit = self._selected_outlier_hit()
-        if hit is None:
-            self._show_warning("No Outlier Selected", "Select one outlier first.")
-            return
-        self._apply_outlier_fixes([hit], empty_message="The selected outlier could not be fixed.")
+    def _add_warning_rule(self) -> None:
+        rule = TemplateOutlierRule(
+            self._next_warning_rule_id(),
+            rule_template=WarningRuleTemplate.SPIKE,
+            target_metric="yaw_deg",
+        )
+        self.outlier_registry.register(rule)
+        self.outlier_rule_enabled[rule.rule_id] = False
+        self.outlier_rule_params[rule.rule_id] = rule.default_params()
+        self._refresh_outlier_rule_table(preserve_rule_id=rule.rule_id)
+        self._load_selected_outlier_rule_editor()
+        self._refresh_visible_outlier_table()
+        self._update_action_states()
 
-    def _fix_current_scope_outliers(self) -> None:
+    def _remove_selected_warning_rule(self) -> None:
         rule_id = self._selected_outlier_rule_id()
         if not rule_id:
-            self._show_warning("No Rule Selected", "Select one outlier rule first.")
+            self._show_warning("No Warning Rule Selected", "Select one warning rule first.")
             return
-        hits = self._scope_filtered_hits(rule_id=rule_id)
-        self._apply_outlier_fixes(hits, empty_message="No fixable outliers were found for the current rule and scope.")
-
-    def _fix_all_visible_outliers(self) -> None:
-        self._apply_outlier_fixes(
-            self.outlier_hits_visible,
-            empty_message="No visible fixable outliers were found.",
+        self.outlier_registry.remove(rule_id)
+        self.outlier_rule_enabled.pop(rule_id, None)
+        self.outlier_rule_params.pop(rule_id, None)
+        self._invalidate_outlier_analysis(
+            show_status=True,
+            message="Warning rule removed. Refresh Warnings to update the hit list.",
         )
-
-    def _apply_outlier_fixes(self, hits: Sequence[OutlierHit], empty_message: str) -> None:
-        if not self._is_postprocessing_stage():
-            self._show_warning("Postprocessing Required", "Outlier fixing is only available in postprocessing.")
-            return
-        if not hits:
-            self.statusBar().showMessage(empty_message, 5000)
-            return
-        working_records = clone_records(self.records)
-        context = self._build_processing_context(require_reprojection=True, records=working_records)
-        if context is None:
-            return
-        selected_hits = list(hits)
-
-        def fix_hits() -> object:
-            result = self.processing_engine.fix_hits(
-                records=working_records,
-                hits=selected_hits,
-                params_by_rule=self.outlier_rule_params,
-                context=context,
-            )
-            return working_records, result
-
-        def apply_fixes(payload: object) -> None:
-            updated_records, result = payload
-            if result.updated_count <= 0:
-                self.statusBar().showMessage(empty_message, 5000)
-                return
-            self.postprocess_session.push_undo_snapshot(self.records)
-            self.records = updated_records
-            self._persist_active_records()
-            self._refresh_current_frame_view()
-            self._refresh_track_table(preserve_track_id=self._selected_track_id())
-            self._invalidate_outlier_analysis()
-            self.statusBar().showMessage(result.message, 6000)
-
-        self._start_io_task(
-            fix_hits,
-            apply_fixes,
-            label="Fixing outliers...",
-            failure_title="Outlier Fix Failed",
-        )
+        self._refresh_outlier_rule_table()
+        self._load_selected_outlier_rule_editor()
+        self._refresh_visible_outlier_table()
+        self._update_action_states()
 
     def _apply_selected_bulk_operation(self) -> None:
         operation_id = self._selected_bulk_operation_id()
@@ -1484,13 +1828,17 @@ class MainWindow(QMainWindow):
             self._show_warning("No Operation Selected", "Select one bulk operation first.")
             return
         if not self._is_postprocessing_stage():
-            self._show_warning("Postprocessing Required", "Bulk operations are only available in postprocessing.")
+            self._show_warning("Postprocessing Required", "Track batch operations are only available in postprocessing.")
+            return
+        selected_track_id = self._selected_track_id()
+        if not selected_track_id:
+            self._show_warning("No Track Selected", "Select one track before applying a track batch operation.")
             return
         working_records = clone_records(self.records)
         context = self._build_processing_context(require_reprojection=True, records=working_records)
         if context is None:
             return
-        operation_scope = OperationScope(self._selected_processing_scope())
+        operation_scope = OperationScope.SELECTED_TRACK
         params = dict(self.bulk_operation_params.get(operation_id) or {})
 
         def apply_operation() -> object:
@@ -1545,7 +1893,12 @@ class MainWindow(QMainWindow):
         )
 
     def _outlier_rule_color(self, rule_id: str) -> QColor | None:
-        color = OUTLIER_RULE_COLORS.get(rule_id)
+        try:
+            rule = self.outlier_registry.get(rule_id)
+        except Exception:
+            return None
+        metric_id = rule.target_metric if isinstance(rule, TemplateOutlierRule) else ""
+        color = WARNING_METRIC_COLORS.get(metric_id)
         return QColor(color) if color is not None else None
 
     def _outlier_background_for_rule(self, rule_id: str) -> QColor | None:
@@ -2325,11 +2678,15 @@ class MainWindow(QMainWindow):
         return None
 
     def _current_filter_config(self) -> FilterConfig:
-        return FilterConfig(
-            min_score=float(self.filter_min_score_spin.value()),
-            min_score_3d=float(self.filter_min_score_3d_spin.value()),
-            max_center_z=float(self.filter_max_center_z_spin.value()),
-            max_range_xz=float(self.filter_max_range_xz_spin.value()),
+        return FilterConfig(rules=tuple(self.filter_rules))
+
+    def _current_tracking_config(self) -> TrackingConfig:
+        return TrackingConfig(
+            max_gap_frames=int(self.tracking_max_gap_frames_spin.value()),
+            max_center_distance_m=float(self.tracking_max_center_distance_spin.value()),
+            min_2d_iou=float(self.tracking_min_2d_iou_spin.value()),
+            min_3d_iou=float(self.tracking_min_3d_iou_spin.value()),
+            previous_id_bonus=float(self.tracking_previous_id_bonus_spin.value()),
         )
 
     def _on_track_selection_changed(self) -> None:
@@ -2343,6 +2700,7 @@ class MainWindow(QMainWindow):
                     self.merge_target_combo.setCurrentIndex(index)
                     break
         self._refresh_track_batch_editor(selected_track_id=selected_track_id or None)
+        self._refresh_visible_outlier_table()
         self._update_action_states()
         if self._current_preview_mode() == PreviewMode.BEV_TRAJECTORY:
             self._refresh_preview()
@@ -2564,7 +2922,11 @@ class MainWindow(QMainWindow):
         if self._is_background_task_running():
             self._show_warning("Run in Progress", "Another background task is already active.")
             return
-        self.tracking_worker = TrackingWorker(records=clone_records(self.records), config=TrackingConfig(), parent=self)
+        self.tracking_worker = TrackingWorker(
+            records=clone_records(self.records),
+            config=self._current_tracking_config(),
+            parent=self,
+        )
         self.tracking_worker.progressChanged.connect(self._on_run_progress)
         self.tracking_worker.runCompleted.connect(self._on_tracking_completed)
         self.tracking_worker.runFailed.connect(self._on_tracking_failed)
@@ -3654,12 +4016,30 @@ class MainWindow(QMainWindow):
         has_source = self.current_provider is not None
         has_selection = self._selected_record() is not None
         has_track_selection = self._selected_track_id() is not None
+        has_filter_rule_selection = self._selected_filter_rule() is not None
         detection_running = self._is_detection_running()
         tracking_running = self._is_tracking_running()
         outlier_running = self._is_outlier_running()
         running = self._controls_locked or detection_running or tracking_running or outlier_running
         postprocessing = self._is_postprocessing_stage()
         detection_stage = self._is_detection_stage()
+
+        section_enabled = {
+            ActivitySection.FILE: True,
+            ActivitySection.DETECT: has_source,
+            ActivitySection.POSTPROCESS: has_source,
+            ActivitySection.TRACK: has_source and postprocessing,
+            ActivitySection.WARNING: has_source and postprocessing,
+        }
+        for section, button in self._activity_buttons.items():
+            button.setEnabled(section_enabled.get(section, False) and not detection_running)
+        if not section_enabled.get(self.activity_section, False):
+            fallback_section = ActivitySection.FILE
+            if has_source and postprocessing:
+                fallback_section = ActivitySection.POSTPROCESS
+            elif has_source:
+                fallback_section = ActivitySection.DETECT
+            self._set_activity_section(fallback_section, allow_toggle=False)
 
         self.navigation_widget.setEnabled(has_source and not detection_running)
         self.preview_mode_combo.setEnabled(has_source and not detection_running)
@@ -3668,6 +4048,7 @@ class MainWindow(QMainWindow):
         self.source_group.setEnabled(not running)
         self.results_group.setEnabled(has_source and not running)
         self.postprocess_group.setEnabled(has_source)
+        self.tracking_group.setEnabled(has_source and postprocessing)
         self.outlier_group.setEnabled(has_source and postprocessing)
         self.bulk_ops_group.setEnabled(has_source and postprocessing)
         self.track_group.setEnabled(has_source and postprocessing)
@@ -3696,31 +4077,37 @@ class MainWindow(QMainWindow):
         self.reset_to_raw_btn.setEnabled(
             has_source and postprocessing and not running and self.current_raw_csv_path is not None and self.current_raw_csv_path.exists()
         )
+        self.filter_rule_table.setEnabled(has_source and postprocessing and not running)
+        self.add_filter_rule_btn.setEnabled(has_source and postprocessing and not running)
+        self.remove_filter_rule_btn.setEnabled(has_source and postprocessing and not running and has_filter_rule_selection)
+        self._set_filter_rule_editor_enabled(has_source and postprocessing and not running and has_filter_rule_selection)
         self.apply_filter_btn.setEnabled(has_source and postprocessing and not running)
-        self.processing_scope_combo.setEnabled(has_source and postprocessing and not running)
+        self.tracking_max_gap_frames_spin.setEnabled(has_source and postprocessing and not running)
+        self.tracking_max_center_distance_spin.setEnabled(has_source and postprocessing and not running)
+        self.tracking_min_2d_iou_spin.setEnabled(has_source and postprocessing and not running)
+        self.tracking_min_3d_iou_spin.setEnabled(has_source and postprocessing and not running)
+        self.tracking_previous_id_bonus_spin.setEnabled(has_source and postprocessing and not running)
 
         self.outlier_rule_table.setEnabled(has_source and postprocessing and not running)
         self.refresh_outliers_btn.setEnabled(has_source and postprocessing and not running)
-        selected_hit = self._selected_outlier_hit()
-        self.fix_selected_outlier_btn.setEnabled(
-            has_source and postprocessing and not running and selected_hit is not None and bool(selected_hit.fixable)
+        self.add_warning_rule_btn.setEnabled(has_source and postprocessing and not running)
+        self.remove_warning_rule_btn.setEnabled(
+            has_source and postprocessing and not running and self._selected_outlier_rule_id() is not None
         )
-        self.fix_scope_outliers_btn.setEnabled(
-            has_source
-            and postprocessing
-            and not running
-            and self._selected_outlier_rule_id() is not None
-            and bool(self._scope_filtered_hits(rule_id=self._selected_outlier_rule_id()))
+        self.warning_template_combo.setEnabled(
+            has_source and postprocessing and not running and self._selected_outlier_rule_id() is not None
         )
-        self.fix_all_visible_outliers_btn.setEnabled(
-            has_source and postprocessing and not running and bool(self.outlier_hits_visible)
+        self.warning_metric_combo.setEnabled(
+            has_source and postprocessing and not running and self._selected_outlier_rule_id() is not None
         )
+        self.warning_selected_rule_filter_checkbox.setEnabled(has_source and postprocessing and not running)
+        self.warning_selected_track_filter_checkbox.setEnabled(has_source and postprocessing and not running and has_track_selection)
         self.outlier_table.setEnabled(has_source and postprocessing and not running)
 
         operation_id = self._selected_bulk_operation_id()
         self.bulk_operation_combo.setEnabled(has_source and postprocessing and not running)
         self.apply_bulk_operation_btn.setEnabled(
-            has_source and postprocessing and not running and bool(operation_id)
+            has_source and postprocessing and not running and bool(operation_id) and has_track_selection
         )
 
         self.track_table.setEnabled(has_source and postprocessing and not running)

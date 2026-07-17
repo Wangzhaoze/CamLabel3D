@@ -213,6 +213,173 @@ class OperationResult:
     affected_det_ids: tuple[str, ...] = ()
 
 
+class WarningRuleTemplate(str, Enum):
+    """Supported warning rule templates."""
+
+    RANGE = "range"
+    SPIKE = "spike"
+    RESIDUAL = "residual"
+
+
+@dataclass(frozen=True)
+class WarningMetricSpec:
+    """Metadata for one warning metric target."""
+
+    metric_id: str
+    label: str
+    value_kind: str
+    supported_templates: tuple[WarningRuleTemplate, ...]
+    default_minimum: float
+    default_maximum: float
+    default_step: float
+    default_decimals: int = 3
+
+
+WARNING_METRIC_SPECS: tuple[WarningMetricSpec, ...] = (
+    WarningMetricSpec(
+        "center",
+        "Center Residual",
+        "center_vector",
+        (WarningRuleTemplate.RESIDUAL,),
+        0.05,
+        1000.0,
+        0.1,
+        3,
+    ),
+    WarningMetricSpec(
+        "size",
+        "Size Residual",
+        "size_vector",
+        (WarningRuleTemplate.RESIDUAL,),
+        0.01,
+        10.0,
+        0.01,
+        3,
+    ),
+    WarningMetricSpec(
+        "score",
+        "Score",
+        "scalar",
+        (WarningRuleTemplate.RANGE, WarningRuleTemplate.SPIKE, WarningRuleTemplate.RESIDUAL),
+        0.0,
+        1.0,
+        0.01,
+        3,
+    ),
+    WarningMetricSpec(
+        "score_2d",
+        "2D Score",
+        "scalar",
+        (WarningRuleTemplate.RANGE, WarningRuleTemplate.SPIKE, WarningRuleTemplate.RESIDUAL),
+        0.0,
+        1.0,
+        0.01,
+        3,
+    ),
+    WarningMetricSpec(
+        "score_3d",
+        "3D Score",
+        "scalar",
+        (WarningRuleTemplate.RANGE, WarningRuleTemplate.SPIKE, WarningRuleTemplate.RESIDUAL),
+        0.0,
+        1.0,
+        0.01,
+        3,
+    ),
+    WarningMetricSpec(
+        "center_x",
+        "center_x",
+        "scalar",
+        (WarningRuleTemplate.RANGE, WarningRuleTemplate.SPIKE, WarningRuleTemplate.RESIDUAL),
+        -100000.0,
+        100000.0,
+        0.5,
+        3,
+    ),
+    WarningMetricSpec(
+        "center_y",
+        "center_y",
+        "scalar",
+        (WarningRuleTemplate.RANGE, WarningRuleTemplate.SPIKE, WarningRuleTemplate.RESIDUAL),
+        -100000.0,
+        100000.0,
+        0.5,
+        3,
+    ),
+    WarningMetricSpec(
+        "center_z",
+        "center_z",
+        "scalar",
+        (WarningRuleTemplate.RANGE, WarningRuleTemplate.SPIKE, WarningRuleTemplate.RESIDUAL),
+        -100000.0,
+        100000.0,
+        0.5,
+        3,
+    ),
+    WarningMetricSpec(
+        "yaw_deg",
+        "Yaw",
+        "angle",
+        (WarningRuleTemplate.RANGE, WarningRuleTemplate.SPIKE, WarningRuleTemplate.RESIDUAL),
+        -360.0,
+        360.0,
+        1.0,
+        2,
+    ),
+    WarningMetricSpec(
+        "pitch_deg",
+        "Pitch",
+        "angle",
+        (WarningRuleTemplate.RANGE, WarningRuleTemplate.SPIKE, WarningRuleTemplate.RESIDUAL),
+        -360.0,
+        360.0,
+        1.0,
+        2,
+    ),
+    WarningMetricSpec(
+        "roll_deg",
+        "Roll",
+        "angle",
+        (WarningRuleTemplate.RANGE, WarningRuleTemplate.SPIKE, WarningRuleTemplate.RESIDUAL),
+        -360.0,
+        360.0,
+        1.0,
+        2,
+    ),
+    WarningMetricSpec(
+        "size_w",
+        "size_w",
+        "scalar",
+        (WarningRuleTemplate.RANGE, WarningRuleTemplate.SPIKE, WarningRuleTemplate.RESIDUAL),
+        0.0,
+        100000.0,
+        0.1,
+        3,
+    ),
+    WarningMetricSpec(
+        "size_l",
+        "size_l",
+        "scalar",
+        (WarningRuleTemplate.RANGE, WarningRuleTemplate.SPIKE, WarningRuleTemplate.RESIDUAL),
+        0.0,
+        100000.0,
+        0.1,
+        3,
+    ),
+    WarningMetricSpec(
+        "size_h",
+        "size_h",
+        "scalar",
+        (WarningRuleTemplate.RANGE, WarningRuleTemplate.SPIKE, WarningRuleTemplate.RESIDUAL),
+        0.0,
+        100000.0,
+        0.1,
+        3,
+    ),
+)
+WARNING_METRIC_SPEC_BY_ID = {spec.metric_id: spec for spec in WARNING_METRIC_SPECS}
+
+
 class OutlierRule:
     """Base class for extensible outlier rules."""
 
@@ -301,6 +468,9 @@ class OutlierRuleRegistry:
 
     def all(self) -> list[OutlierRule]:
         return list(self._rules.values())
+
+    def remove(self, rule_id: str) -> None:
+        self._rules.pop(str(rule_id), None)
 
 
 class BulkOperationRegistry:
@@ -676,38 +846,99 @@ def apply_track_batch_edit(
     )
 
 
-class EulerAngleSpikeRule(OutlierRule):
-    """Track-level Euler-angle jump detector for one axis."""
+class TemplateOutlierRule(OutlierRule):
+    """Template-driven read-only warning rule."""
 
-    _ANGLE_LABELS = {
-        "yaw": "Yaw",
-        "pitch": "Pitch",
-        "roll": "Roll",
-    }
+    def __init__(
+        self,
+        rule_id: str,
+        *,
+        rule_template: WarningRuleTemplate,
+        target_metric: str,
+        default_enabled: bool = False,
+    ) -> None:
+        self.rule_id = str(rule_id).strip()
+        self.default_enabled = bool(default_enabled)
+        self.reconfigure(rule_template=rule_template, target_metric=target_metric)
 
-    def __init__(self, axis_name: str) -> None:
-        if axis_name not in self._ANGLE_LABELS:
-            raise ValueError(f"Unsupported Euler axis: {axis_name}")
-        self.axis_name = axis_name
-        self.angle_field = f"{axis_name}_deg"
-        angle_label = self._ANGLE_LABELS[axis_name]
-        self.rule_id = f"{axis_name}_spike"
-        self.display_name = f"{angle_label} Spike"
-        self._jump_key = f"{axis_name}_jump_deg"
-        self._residual_key = f"{axis_name}_residual_deg"
-        self.param_specs = (
-            ParameterSpec(self._jump_key, f"{angle_label} Jump (deg)", "float", 60.0, 5.0, 360.0, 1.0, 1),
+    def reconfigure(self, *, rule_template: WarningRuleTemplate, target_metric: str) -> None:
+        self.rule_template = WarningRuleTemplate(rule_template)
+        metric_id = str(target_metric or "").strip()
+        if metric_id not in WARNING_METRIC_SPEC_BY_ID:
+            metric_id = "center"
+        metric_spec = WARNING_METRIC_SPEC_BY_ID[metric_id]
+        if self.rule_template not in metric_spec.supported_templates:
+            self.rule_template = metric_spec.supported_templates[0]
+        self.target_metric = metric_spec.metric_id
+        self.metric_spec = metric_spec
+        self.display_name = self._default_display_name()
+        self.param_specs = self._build_param_specs()
+
+    def _default_display_name(self) -> str:
+        suffix = {
+            WarningRuleTemplate.RANGE: "Range",
+            WarningRuleTemplate.SPIKE: "Spike",
+            WarningRuleTemplate.RESIDUAL: "Residual",
+        }[self.rule_template]
+        return f"{self.metric_spec.label} {suffix}"
+
+    def _build_param_specs(self) -> tuple[ParameterSpec, ...]:
+        spec = self.metric_spec
+        if self.rule_template == WarningRuleTemplate.RANGE:
+            return (
+                ParameterSpec("min_value", "Min Value", "float", spec.default_minimum, spec.default_minimum, spec.default_maximum, spec.default_step, spec.default_decimals),
+                ParameterSpec("max_value", "Max Value", "float", spec.default_maximum, spec.default_minimum, spec.default_maximum, spec.default_step, spec.default_decimals),
+            )
+        if self.rule_template == WarningRuleTemplate.SPIKE:
+            label = "Jump Threshold"
+            minimum = spec.default_step
+            maximum = spec.default_maximum
+            default = 60.0 if spec.value_kind == "angle" else max(spec.default_step * 5.0, 1.0)
+            if spec.metric_id.startswith("score"):
+                default = 0.25
+                minimum = 0.01
+                maximum = 1.0
+            return (
+                ParameterSpec("jump_threshold", label, "float", default, minimum, maximum, spec.default_step, spec.default_decimals),
+                ParameterSpec("min_track_length", "Min Track Length", "int", 3, 3, 10000, 1, 0),
+            )
+        residual_label = "Residual Threshold"
+        default = 1.0
+        minimum = spec.default_step
+        maximum = spec.default_maximum
+        decimals = spec.default_decimals
+        if spec.value_kind == "angle":
+            residual_label = f"{spec.label} Residual (deg)"
+            default = 45.0
+            minimum = 1.0
+            maximum = 360.0
+            decimals = 1
+        elif spec.value_kind == "center_vector":
+            residual_label = "Center Residual (m)"
+            default = 1.5
+            minimum = 0.05
+            maximum = 1000.0
+        elif spec.value_kind == "size_vector":
+            residual_label = "Relative Delta"
+            default = 0.25
+            minimum = 0.01
+            maximum = 10.0
+        elif spec.metric_id.startswith("score"):
+            default = 0.15
+            minimum = 0.01
+            maximum = 1.0
+        return (
+            ParameterSpec("residual_threshold", residual_label, "float", default, minimum, maximum, spec.default_step, decimals),
             ParameterSpec(
-                self._residual_key,
-                f"{angle_label} Residual (deg)",
-                "float",
-                45.0,
-                1.0,
-                360.0,
-                1.0,
+                "min_track_length",
+                "Min Track Length",
+                "int",
+                2 if spec.value_kind == "size_vector" else 3,
+                2 if spec.value_kind == "size_vector" else 3,
+                10000,
                 1,
+                0,
             ),
-            ParameterSpec("min_track_length", "Min Track Length", "int", 3, 3, 10000, 1, 0),
         )
 
     def analyze(
@@ -717,46 +948,80 @@ class EulerAngleSpikeRule(OutlierRule):
         context: ProcessingContext,
         params: dict[str, float | int] | None = None,
     ) -> list[OutlierHit]:
+        del records
         settings = self.normalize_params(params)
-        jump_threshold = float(settings[self._jump_key])
-        residual_threshold = float(settings[self._residual_key])
+        if self.rule_template == WarningRuleTemplate.RANGE:
+            return self._analyze_range(scope, context, settings)
+        if self.rule_template == WarningRuleTemplate.SPIKE:
+            return self._analyze_spike(scope, context, settings)
+        return self._analyze_residual(scope, context, settings)
+
+    def fix(
+        self,
+        records: list[DetectionRecord],
+        hits: Sequence[OutlierHit],
+        params: dict[str, float | int] | None,
+        context: ProcessingContext,
+    ) -> OperationResult:
+        del records, hits, params, context
+        return OperationResult(updated_count=0, message="Warning rules are read-only.")
+
+    def _analyze_range(
+        self,
+        scope: OutlierScope,
+        context: ProcessingContext,
+        settings: dict[str, float | int],
+    ) -> list[OutlierHit]:
+        min_value = float(settings["min_value"])
+        max_value = float(settings["max_value"])
+        if max_value < min_value:
+            min_value, max_value = max_value, min_value
+        hits: list[OutlierHit] = []
+        for record in context.target_records(scope):
+            value = self._scalar_metric_value(record)
+            if value is None or (min_value <= value <= max_value):
+                continue
+            distance = (min_value - value) if value < min_value else (value - max_value)
+            severity = abs(distance) / max(abs(max_value - min_value), 1.0, EPS)
+            hits.append(
+                OutlierHit(
+                    rule_id=self.rule_id,
+                    frame_index=record.frame_index,
+                    det_id=record.det_id,
+                    track_id=str(record.track_id).strip(),
+                    category=record.category,
+                    severity=float(severity),
+                    message=f"{self.metric_spec.label} out of range [{min_value:.3f}, {max_value:.3f}]",
+                    fixable=False,
+                    metadata={"value": float(value), "min_value": min_value, "max_value": max_value},
+                )
+            )
+        return hits
+
+    def _analyze_spike(
+        self,
+        scope: OutlierScope,
+        context: ProcessingContext,
+        settings: dict[str, float | int],
+    ) -> list[OutlierHit]:
+        jump_threshold = float(settings["jump_threshold"])
         min_track_length = int(settings["min_track_length"])
         target_ids = context.target_det_ids(scope)
         hits: list[OutlierHit] = []
-        angle_label = self._ANGLE_LABELS[self.axis_name]
         for track_id, track_records in context.track_groups().items():
             if len(track_records) < min_track_length:
                 continue
-            angle_values = [float(getattr(record, self.angle_field)) for record in track_records]
-            unwrapped = _unwrap_angles_deg(angle_values)
             for index in range(1, len(track_records) - 1):
                 record = track_records[index]
                 if record.det_id not in target_ids:
                     continue
                 prev_record = track_records[index - 1]
                 next_record = track_records[index + 1]
-                expected_angle = _linear_interpolate_scalar(
-                    prev_record.frame_index,
-                    float(unwrapped[index - 1]),
-                    next_record.frame_index,
-                    float(unwrapped[index + 1]),
-                    record.frame_index,
-                )
-                residual = abs(float(unwrapped[index]) - float(expected_angle))
-                jump_prev = _wrapped_abs_delta_deg(
-                    float(getattr(record, self.angle_field)),
-                    float(getattr(prev_record, self.angle_field)),
-                )
-                jump_next = _wrapped_abs_delta_deg(
-                    float(getattr(record, self.angle_field)),
-                    float(getattr(next_record, self.angle_field)),
-                )
-                if residual < residual_threshold or max(jump_prev, jump_next) < jump_threshold:
+                jump_prev = self._metric_delta(record, prev_record)
+                jump_next = self._metric_delta(record, next_record)
+                spike_value = max(jump_prev, jump_next)
+                if spike_value < jump_threshold:
                     continue
-                severity = max(
-                    residual / max(residual_threshold, EPS),
-                    max(jump_prev, jump_next) / max(jump_threshold, EPS),
-                )
                 hits.append(
                     OutlierHit(
                         rule_id=self.rule_id,
@@ -764,179 +1029,117 @@ class EulerAngleSpikeRule(OutlierRule):
                         det_id=record.det_id,
                         track_id=track_id,
                         category=record.category,
-                        severity=float(severity),
+                        severity=float(spike_value / max(jump_threshold, EPS)),
                         message=(
-                            f"{angle_label} spike: expected {_normalize_angle_deg(expected_angle):.1f} deg, "
-                            f"residual {residual:.1f} deg, "
-                            f"neighbor jumps {jump_prev:.1f}/{jump_next:.1f} deg"
+                            f"{self.metric_spec.label} spike: "
+                            f"neighbor jumps {jump_prev:.3f}/{jump_next:.3f}"
                         ),
-                        fixable=True,
+                        fixable=False,
                         metadata={
-                            "expected_angle_temporal_deg": _normalize_angle_deg(expected_angle),
-                            "angle_field": self.angle_field,
-                            "residual_deg": residual,
-                            "jump_prev_deg": jump_prev,
-                            "jump_next_deg": jump_next,
-                        },
-                    )
-                )
-                if self.axis_name == "yaw":
-                    hits[-1].metadata["expected_yaw_temporal_deg"] = _normalize_angle_deg(expected_angle)
-        return hits
-
-    def fix(
-        self,
-        records: list[DetectionRecord],
-        hits: Sequence[OutlierHit],
-        params: dict[str, float | int] | None,
-        context: ProcessingContext,
-    ) -> OperationResult:
-        updated = 0
-        affected: list[str] = []
-        angle_label = self._ANGLE_LABELS[self.axis_name]
-        for hit in hits:
-            record = context.record_by_id(hit.det_id)
-            if record is None:
-                continue
-            target_angle = float(hit.metadata.get("expected_angle_temporal_deg", getattr(record, self.angle_field)))
-
-            def mutate(item: DetectionRecord) -> None:
-                setattr(item, self.angle_field, _normalize_angle_deg(target_angle))
-
-            if _try_update_geometry(record, context, mutate):
-                updated += 1
-                affected.append(record.det_id)
-        return OperationResult(
-            updated_count=updated,
-            message=f"{angle_label} spike fix updated {updated} detections.",
-            affected_det_ids=tuple(sorted(set(affected))),
-        )
-
-
-class SizeSpikeRule(OutlierRule):
-    rule_id = "size_spike"
-    display_name = "Size Spike"
-    param_specs = (
-        ParameterSpec("size_rel_delta", "Relative Delta", "float", 0.25, 0.01, 10.0, 0.01, 3),
-        ParameterSpec("min_track_length", "Min Track Length", "int", 3, 2, 10000, 1, 0),
-    )
-
-    def analyze(
-        self,
-        records: list[DetectionRecord],
-        scope: OutlierScope,
-        context: ProcessingContext,
-        params: dict[str, float | int] | None = None,
-    ) -> list[OutlierHit]:
-        settings = self.normalize_params(params)
-        rel_threshold = float(settings["size_rel_delta"])
-        min_track_length = int(settings["min_track_length"])
-        target_ids = context.target_det_ids(scope)
-        hits: list[OutlierHit] = []
-        size_refs = _track_size_map(context.track_groups())
-        for track_id, track_records in context.track_groups().items():
-            if len(track_records) < min_track_length or track_id not in size_refs:
-                continue
-            ref_w, ref_l, ref_h = size_refs[track_id]
-            ref_dims = np.array([ref_w, ref_l, ref_h], dtype=np.float64)
-            for record in track_records:
-                if record.det_id not in target_ids:
-                    continue
-                dims = np.array([record.size_w, record.size_l, record.size_h], dtype=np.float64)
-                rel = np.abs(dims - ref_dims) / np.maximum(np.abs(ref_dims), EPS)
-                max_rel = float(np.max(rel))
-                if max_rel < rel_threshold:
-                    continue
-                hits.append(
-                    OutlierHit(
-                        rule_id=self.rule_id,
-                        frame_index=record.frame_index,
-                        det_id=record.det_id,
-                        track_id=track_id,
-                        category=record.category,
-                        severity=max_rel / max(rel_threshold, EPS),
-                        message=f"Size spike: max relative delta {max_rel:.3f}",
-                        fixable=True,
-                        metadata={
-                            "ref_size_w": ref_w,
-                            "ref_size_l": ref_l,
-                            "ref_size_h": ref_h,
-                            "max_rel_delta": max_rel,
+                            "jump_prev": float(jump_prev),
+                            "jump_next": float(jump_next),
+                            "jump_threshold": jump_threshold,
                         },
                     )
                 )
         return hits
 
-    def fix(
+    def _analyze_residual(
         self,
-        records: list[DetectionRecord],
-        hits: Sequence[OutlierHit],
-        params: dict[str, float | int] | None,
-        context: ProcessingContext,
-    ) -> OperationResult:
-        updated = 0
-        affected: list[str] = []
-        for hit in hits:
-            record = context.record_by_id(hit.det_id)
-            if record is None:
-                continue
-            ref_w = float(hit.metadata.get("ref_size_w", record.size_w))
-            ref_l = float(hit.metadata.get("ref_size_l", record.size_l))
-            ref_h = float(hit.metadata.get("ref_size_h", record.size_h))
-
-            def mutate(item: DetectionRecord) -> None:
-                item.size_w = ref_w
-                item.size_l = ref_l
-                item.size_h = ref_h
-
-            if _try_update_geometry(record, context, mutate):
-                updated += 1
-                affected.append(record.det_id)
-        return OperationResult(
-            updated_count=updated,
-            message=f"Size spike fix updated {updated} detections.",
-            affected_det_ids=tuple(sorted(set(affected))),
-        )
-
-
-class CenterSpikeRule(OutlierRule):
-    rule_id = "center_spike"
-    display_name = "Center Spike"
-    param_specs = (
-        ParameterSpec("center_residual_m", "Center Residual (m)", "float", 1.5, 0.05, 1000.0, 0.1, 3),
-        ParameterSpec("min_track_length", "Min Track Length", "int", 3, 3, 10000, 1, 0),
-    )
-
-    def analyze(
-        self,
-        records: list[DetectionRecord],
         scope: OutlierScope,
         context: ProcessingContext,
-        params: dict[str, float | int] | None = None,
+        settings: dict[str, float | int],
     ) -> list[OutlierHit]:
-        settings = self.normalize_params(params)
-        residual_threshold = float(settings["center_residual_m"])
+        residual_threshold = float(settings["residual_threshold"])
         min_track_length = int(settings["min_track_length"])
         target_ids = context.target_det_ids(scope)
         hits: list[OutlierHit] = []
+        if self.metric_spec.value_kind == "size_vector":
+            size_refs = _track_size_map(context.track_groups())
+            for track_id, track_records in context.track_groups().items():
+                if len(track_records) < min_track_length or track_id not in size_refs:
+                    continue
+                ref_w, ref_l, ref_h = size_refs[track_id]
+                ref_dims = np.array([ref_w, ref_l, ref_h], dtype=np.float64)
+                for record in track_records:
+                    if record.det_id not in target_ids:
+                        continue
+                    dims = np.array([record.size_w, record.size_l, record.size_h], dtype=np.float64)
+                    rel = np.abs(dims - ref_dims) / np.maximum(np.abs(ref_dims), EPS)
+                    max_rel = float(np.max(rel))
+                    if max_rel < residual_threshold:
+                        continue
+                    hits.append(
+                        OutlierHit(
+                            rule_id=self.rule_id,
+                            frame_index=record.frame_index,
+                            det_id=record.det_id,
+                            track_id=track_id,
+                            category=record.category,
+                            severity=float(max_rel / max(residual_threshold, EPS)),
+                            message=f"{self.metric_spec.label}: max relative delta {max_rel:.3f}",
+                            fixable=False,
+                            metadata={"max_rel_delta": max_rel, "ref_size_w": ref_w, "ref_size_l": ref_l, "ref_size_h": ref_h},
+                        )
+                    )
+            return hits
+
         for track_id, track_records in context.track_groups().items():
             if len(track_records) < min_track_length:
                 continue
+            if self.metric_spec.value_kind == "center_vector":
+                for index in range(1, len(track_records) - 1):
+                    record = track_records[index]
+                    if record.det_id not in target_ids:
+                        continue
+                    prev_record = track_records[index - 1]
+                    next_record = track_records[index + 1]
+                    pred_center = _linear_interpolate_vector(
+                        prev_record.frame_index,
+                        np.array([prev_record.center_x, prev_record.center_y, prev_record.center_z], dtype=np.float64),
+                        next_record.frame_index,
+                        np.array([next_record.center_x, next_record.center_y, next_record.center_z], dtype=np.float64),
+                        record.frame_index,
+                    )
+                    center = np.array([record.center_x, record.center_y, record.center_z], dtype=np.float64)
+                    residual = float(np.linalg.norm(center - pred_center))
+                    if residual < residual_threshold:
+                        continue
+                    hits.append(
+                        OutlierHit(
+                            rule_id=self.rule_id,
+                            frame_index=record.frame_index,
+                            det_id=record.det_id,
+                            track_id=track_id,
+                            category=record.category,
+                            severity=float(residual / max(residual_threshold, EPS)),
+                            message=f"{self.metric_spec.label}: residual {residual:.3f}",
+                            fixable=False,
+                            metadata={"residual": residual},
+                        )
+                    )
+                continue
+
+            values = np.asarray(
+                [self._metric_series_value(record) for record in track_records],
+                dtype=np.float64,
+            )
+            if self.metric_spec.value_kind == "angle":
+                values = _unwrap_angles_deg(values)
             for index in range(1, len(track_records) - 1):
                 record = track_records[index]
                 if record.det_id not in target_ids:
                     continue
                 prev_record = track_records[index - 1]
                 next_record = track_records[index + 1]
-                pred_center = _linear_interpolate_vector(
+                expected_value = _linear_interpolate_scalar(
                     prev_record.frame_index,
-                    np.array([prev_record.center_x, prev_record.center_y, prev_record.center_z], dtype=np.float64),
+                    float(values[index - 1]),
                     next_record.frame_index,
-                    np.array([next_record.center_x, next_record.center_y, next_record.center_z], dtype=np.float64),
+                    float(values[index + 1]),
                     record.frame_index,
                 )
-                center = np.array([record.center_x, record.center_y, record.center_z], dtype=np.float64)
-                residual = float(np.linalg.norm(center - pred_center))
+                residual = abs(float(values[index]) - float(expected_value))
                 if residual < residual_threshold:
                     continue
                 hits.append(
@@ -946,49 +1149,35 @@ class CenterSpikeRule(OutlierRule):
                         det_id=record.det_id,
                         track_id=track_id,
                         category=record.category,
-                        severity=residual / max(residual_threshold, EPS),
-                        message=f"Center spike: residual {residual:.3f} m",
-                        fixable=True,
-                        metadata={
-                            "pred_center_x": float(pred_center[0]),
-                            "pred_center_y": float(pred_center[1]),
-                            "pred_center_z": float(pred_center[2]),
-                            "residual_m": residual,
-                        },
+                        severity=float(residual / max(residual_threshold, EPS)),
+                        message=f"{self.metric_spec.label}: residual {residual:.3f}",
+                        fixable=False,
+                        metadata={"residual": residual, "expected_value": float(expected_value)},
                     )
                 )
         return hits
 
-    def fix(
-        self,
-        records: list[DetectionRecord],
-        hits: Sequence[OutlierHit],
-        params: dict[str, float | int] | None,
-        context: ProcessingContext,
-    ) -> OperationResult:
-        updated = 0
-        affected: list[str] = []
-        for hit in hits:
-            record = context.record_by_id(hit.det_id)
-            if record is None:
-                continue
-            pred_x = float(hit.metadata.get("pred_center_x", record.center_x))
-            pred_y = float(hit.metadata.get("pred_center_y", record.center_y))
-            pred_z = float(hit.metadata.get("pred_center_z", record.center_z))
+    def _scalar_metric_value(self, record: DetectionRecord) -> float | None:
+        if self.metric_spec.value_kind not in {"scalar", "angle"}:
+            return None
+        value = float(getattr(record, self.target_metric))
+        if self.metric_spec.value_kind == "angle":
+            return _normalize_angle_deg(value)
+        return value
 
-            def mutate(item: DetectionRecord) -> None:
-                item.center_x = pred_x
-                item.center_y = pred_y
-                item.center_z = pred_z
+    def _metric_series_value(self, record: DetectionRecord) -> float:
+        value = self._scalar_metric_value(record)
+        if value is None:
+            raise ValueError(f"Metric '{self.target_metric}' is not scalar-like.")
+        return float(value)
 
-            if _try_update_geometry(record, context, mutate):
-                updated += 1
-                affected.append(record.det_id)
-        return OperationResult(
-            updated_count=updated,
-            message=f"Center spike fix updated {updated} detections.",
-            affected_det_ids=tuple(sorted(set(affected))),
-        )
+    def _metric_delta(self, left: DetectionRecord, right: DetectionRecord) -> float:
+        if self.metric_spec.value_kind == "angle":
+            return _wrapped_abs_delta_deg(
+                float(getattr(left, self.target_metric)),
+                float(getattr(right, self.target_metric)),
+            )
+        return abs(self._metric_series_value(left) - self._metric_series_value(right))
 
 
 class SmoothAnglesOperation(BulkOperation):
@@ -1227,11 +1416,41 @@ class SmoothTrackCentersOperation(BulkOperation):
 
 def build_default_outlier_registry() -> OutlierRuleRegistry:
     registry = OutlierRuleRegistry()
-    registry.register(EulerAngleSpikeRule("yaw"))
-    registry.register(EulerAngleSpikeRule("pitch"))
-    registry.register(EulerAngleSpikeRule("roll"))
-    registry.register(SizeSpikeRule())
-    registry.register(CenterSpikeRule())
+    registry.register(
+        TemplateOutlierRule(
+            "yaw_spike",
+            rule_template=WarningRuleTemplate.SPIKE,
+            target_metric="yaw_deg",
+        )
+    )
+    registry.register(
+        TemplateOutlierRule(
+            "pitch_spike",
+            rule_template=WarningRuleTemplate.SPIKE,
+            target_metric="pitch_deg",
+        )
+    )
+    registry.register(
+        TemplateOutlierRule(
+            "roll_spike",
+            rule_template=WarningRuleTemplate.SPIKE,
+            target_metric="roll_deg",
+        )
+    )
+    registry.register(
+        TemplateOutlierRule(
+            "size_spike",
+            rule_template=WarningRuleTemplate.RESIDUAL,
+            target_metric="size",
+        )
+    )
+    registry.register(
+        TemplateOutlierRule(
+            "center_spike",
+            rule_template=WarningRuleTemplate.RESIDUAL,
+            target_metric="center",
+        )
+    )
     return registry
 
 

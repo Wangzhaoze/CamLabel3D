@@ -8,8 +8,10 @@ from camlabel3d.core.processing import (
     OutlierScope,
     ProcessingContext,
     ProcessingEngine,
+    TemplateOutlierRule,
     TrackBatchEditRequest,
     TrackBatchOperationKind,
+    WarningRuleTemplate,
     apply_track_batch_edit,
     build_default_bulk_operation_registry,
     build_default_outlier_registry,
@@ -139,6 +141,30 @@ class ProcessingEngineTests(unittest.TestCase):
 
         self.assertTrue(all(hit.frame_index == 1 for hit in frame_hits))
         self.assertTrue(all(hit.track_id == "1" for hit in track_hits))
+
+    def test_template_warning_rule_can_reconfigure_and_remains_read_only(self) -> None:
+        records = [make_record(0, score=1.4, track_id="1")]
+        context = ProcessingContext(records=records)
+        rule = TemplateOutlierRule(
+            "score_check",
+            rule_template=WarningRuleTemplate.SPIKE,
+            target_metric="yaw_deg",
+        )
+
+        rule.reconfigure(
+            rule_template=WarningRuleTemplate.RANGE,
+            target_metric="score",
+        )
+        hits = rule.analyze(records, OutlierScope.GLOBAL, context, params={"min_value": 0.0, "max_value": 1.0})
+        result = rule.fix(records, hits, params=None, context=context)
+
+        self.assertEqual(rule.display_name, "Score Range")
+        self.assertEqual(rule.target_metric, "score")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].rule_id, "score_check")
+        self.assertEqual(result.updated_count, 0)
+        self.assertEqual(result.message, "Warning rules are read-only.")
+        self.assertAlmostEqual(records[0].score, 1.4, places=6)
 
     def test_fix_track_size_can_target_current_frame_scope(self) -> None:
         records = [
